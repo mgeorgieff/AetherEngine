@@ -11,10 +11,12 @@ struct Issue944LatchedReadErrorTests {
 
     /// The fixture, with reads that fail while `failing` is set.
     private final class FlakyReader: IOReader, @unchecked Sendable {
-        private let bytes = TinyTransportStreamFixture.data
+        private let bytes: Data
         private let lock = NSLock()
         private var position = 0
         private var failingValue = false
+
+        init(bytes: Data = TinyTransportStreamFixture.data) { self.bytes = bytes }
 
         var failing: Bool {
             get { lock.withLock { failingValue } }
@@ -98,6 +100,28 @@ struct Issue944LatchedReadErrorTests {
         let after = drainEndsInError(demuxer)
         #expect(after.packets > 0)
         #expect(after.failed == false, "the source is healthy again; only the stored error could fail it")
+    }
+
+    /// The 7.54.0 retest: Matroska keeps its own end-of-stream latch (`MatroskaDemuxContext.done`),
+    /// set when a failed read sends `matroska_resync` into EOF. A timestamp seek resets it, a byte
+    /// seek does not, so a byte-estimate landing after a deadline-cut read handed the side reader
+    /// EOF at second 0 of the file and the prefetcher stopped as if the source had ended.
+    @Test("a failed Matroska read does not end the source after a byte-estimate reposition")
+    func byteEstimateClearsMatroskaEndLatch() throws {
+        let events = (0..<20).map { (ms: $0 * 10_000, durationMs: 2_000) }
+        let reader = FlakyReader(bytes: MatroskaSubtitleFixture.make(durationMs: 200_000, events: events))
+        let demuxer = Demuxer()
+        try demuxer.open(reader: reader, formatHint: "matroska")
+        defer { demuxer.close() }
+
+        reader.failing = true
+        _ = drainEndsInError(demuxer)
+        reader.failing = false
+
+        #expect(demuxer.seekByteEstimate(to: 0, knownDuration: 200, timeout: 5))
+        let after = drainEndsInError(demuxer)
+        #expect(after.packets == events.count, "every cue is still in the source")
+        #expect(after.failed == false)
     }
 
     @Test("a closed demuxer keeps its error and skips the fallback")
