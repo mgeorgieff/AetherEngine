@@ -809,7 +809,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         case "nativesubs":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
         case let call where call.hasPrefix("seekfar") || call.hasPrefix("subsoff")
-            || call.hasPrefix("subson") || call.hasPrefix("nativerender"):
+            || call.hasPrefix("subson") || call.hasPrefix("nativerender") || call.hasPrefix("lanreload"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
             print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson)")
@@ -1016,6 +1016,12 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     let nativeRenderTick: Int? = hostCalls.first(where: { $0.hasPrefix("nativerender") }).map { call in
         let parts = call.split(separator: "@")
         return parts.count == 2 ? (Int(parts[1]) ?? 8) : 8
+    }
+    // AE#955: the session-preserving reload the wireless AirPlay edge starts (`reloadAtCurrentPosition`),
+    // fired by hand, since a Mac run has no receiver to flip the route. `lanreload@N` picks the tick.
+    let lanReloadTick: Int? = hostCalls.first(where: { $0.hasPrefix("lanreload") }).map { call in
+        let parts = call.split(separator: "@")
+        return parts.count == 2 ? (Int(parts[1]) ?? 10) : 10
     }
     let subsOffTick: Int? = hostCalls.first(where: { $0.hasPrefix("subsoff") }).map { call in
         let parts = call.split(separator: "@")
@@ -1439,6 +1445,15 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         if let t = nativeRenderTick, tick == t + 2 {
             await reportLegibleSelection(engine, "after render on")
             await reportServedVTT(engine, "after render on", around: engine.currentTime, sessionStart: startPosition ?? 0)
+        }
+        if let t = lanReloadTick, tick == t {
+            print("  HOSTCALL reloadAtCurrentPosition() (AE#955 LAN swap) active=\(engine.activeSubtitleTrackIndex.map(String.init) ?? "nil")")
+            do { try await engine.reloadAtCurrentPosition() } catch { print("  reload threw \(error)") }
+            print("  AE#955 after reload active=\(engine.activeSubtitleTrackIndex.map(String.init) ?? "nil")")
+        }
+        if let t = lanReloadTick, tick == t + 4 {
+            await reportLegibleSelection(engine, "after LAN reload")
+            await reportServedVTT(engine, "after LAN reload", around: engine.currentTime, sessionStart: startPosition ?? 0)
         }
         if let subsOffTick, tick == subsOffTick {
             print("  HOSTCALL subtitles off")

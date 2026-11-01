@@ -117,7 +117,7 @@ swift run aetherctl play --fel --surface --dv-pin 'darkest:240,period:2' <url>  
 swift run aetherctl play --upscale <sd-or-720p-url>           # opt in to upscaling sub-1080p SDR video to the display (LoadOptions.upscalesLowResolutionVideo, #846); logs one [Upscale] line and an UPSCALE line once the first frame is upscaled
 ```
 
-`--host-calls nativesubs,nativerender@N,subsoff@N,subson@N` drives the NATIVE SUBTITLE RENDITION path
+`--host-calls nativesubs,nativerender@N,subsoff@N,subson@N,lanreload@N` drives the NATIVE SUBTITLE RENDITION path
 for VOD, which nothing here could do before (Sodalite#156). `serve --native-subs` stands the renditions
 up and `live --force-master` routes a channel behind them, but no VOD session loaded with
 `prepareNativeSubtitles`, so the half that matters was untestable: whether AVPlayer actually HOLDS a
@@ -140,6 +140,22 @@ A healthy run reads `selected=German engineActive=2`, then `selected=none engine
 off, then `selected=German engineActive=2` after the on. `selected=German engineActive=nil` is a
 rendition nobody is filling any more, which on an AirPlay receiver is an empty caption box; and
 `selected=none engineActive=2` is subtitles that never came back.
+
+`lanreload@N` fires `reloadAtCurrentPosition()` at tick N, the session-preserving rebuild a wireless
+AirPlay receiver starts (AE#955), and prints `activeSubtitleTrackIndex` on both sides of it plus a
+`LEGIBLE` and `VTT` readout four ticks later. A Mac has no receiver to flip the route, so this is the
+reload without the route. With a bitmap track it also drives the OCR-fed rendition through the rebuild:
+
+```bash
+aetherctl play --subs eng --seconds 30 \
+  --host-calls nativesubs,lanreload@8,nativerender@14,subson@15 file://$PWD/pgs.mkv
+```
+
+A healthy run arms `[SubtitleOCR] worker armed` once, logs `OCR pre-fill done ... exit=covered` and
+reads `selected=English engineActive=4` after the on. The first Vision call in a process can take about
+a minute while the system compiles its model, so judge a slow pre-fill from a second run. The `VTT`
+readout fetches the first rendition when none is selected, so its empty segments before the select are
+the harness asking, not a receiver.
 
 `--sidecar <lang>=<path-or-url>[,<lang>=<path>...]` fills `LoadOptions.externalSubtitles`, the load-time
 declaration a host makes. On a remote `m3u8` this is what makes the engine stand up its rewritten master
