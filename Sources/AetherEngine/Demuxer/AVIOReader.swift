@@ -980,11 +980,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the tick can read the volume of the last `connStallTimeout`. Both reset with the generation.
     private var genDeliveredBytes: Int64 = 0
     private var trickleSamples: [(at: DispatchTime, bytes: Int64)] = []
-    /// When the read in progress first blocked in the forward wait, and at which offset. Nil
-    /// whenever no read is waiting on forward data (a paused player, a full window, a read that
-    /// returned), which is what keeps the trickle verdict off every state except a starved read.
+    /// Starved-since clock: when the consumer first blocked in the forward wait, and at which
+    /// offset. It survives consecutive reads, because FFmpeg reads at most one AVIO buffer
+    /// (256 KB) at a time, and a drip of 256 KB every 15 s finishes every read inside
+    /// `connStallTimeout`: a per-read clock restarts with each one and never reaches the verdict.
+    /// Cleared when a read is served without waiting (the window had the bytes), when a
+    /// generation starts (a seek, a refill, a replacement), and on a full window.
     private var forwardWaitSince: DispatchTime?
     private var forwardWaitOffset: Int64 = 0
+    /// True only while a read is blocked in the forward wait right now, so a consumer that has
+    /// stopped reading (a paused player) is never judged on a clock it left running.
+    private var forwardWaitActive = false
     private var trickleEnds = 0
 
     /// #309: earliest time the read loop may replace a FAULTED connection from the serve path.
@@ -2388,9 +2394,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let diagGenAtStart = connGeneration
         let diagDropsAtStart = staleGenDroppedBytes
         winCond.unlock()
+        var enteredForwardWait = false
         defer {
             winCond.lock()
-            forwardWaitSince = nil
+            forwardWaitActive = false
+            if !enteredForwardWait { forwardWaitSince = nil }
             winCond.unlock()
         }
         defer {
@@ -2762,7 +2770,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if forwardWaitSince == nil {
                     forwardWaitSince = waitStart
                     forwardWaitOffset = curPosition
+                    // No mark from before the starvation began may be judged: one taken ahead of a
+                    // full-window park would fold the park's zero delivery into the span.
+                    trickleSamples = [(waitStart, genDeliveredBytes)]
                 }
+                enteredForwardWait = true
+                forwardWaitActive = true
                 let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: connStallTimeout), readDeadline))
                 winCond.unlock()
                 diag.recordStallWait(ms: msSince(waitStart), signaled: signaled)
@@ -3582,6 +3595,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         lastDeliveryAt = connStartedAt       // #309: the gap is measured from here until data lands
         genDeliveredBytes = 0
         trickleSamples = [(connStartedAt, 0)]
+        forwardWaitSince = nil
         // `nextFaultedRefillAt` is deliberately NOT reset here. The faulted-refill ladder sets it
         // just before authorising this very reconnect, so a reset on connection start erased the
         // pacing it had just announced — every "next attempt in Ns" fired as fast as the consumer
@@ -3794,6 +3808,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             lastDeliveryAt = DispatchTime.now()
             // Same for the trickle marks: a park is not a slow stretch.
             trickleSamples = [(lastDeliveryAt, genDeliveredBytes)]
+            forwardWaitSince = nil   // a full window is not a starved consumer
             winCond.unlock()
             armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
             return
@@ -3839,8 +3854,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// 40 to 100 s, each drip reset `lastDeliveryAt`, and for three minutes one read after another
     /// waited while no `no delivery` line ever fired and the forward buffer drained into a 25 s
     /// AVPlayer stall. The read loop's forward wait has the same blind spot (every drip signals it).
-    /// This judges VOLUME instead: a read blocked on forward data for `connStallTimeout`, with fewer
-    /// than `trickleFloorBytes` delivered over the last `connStallTimeout`, ends the generation.
+    /// This judges VOLUME instead: a consumer starved on forward data for `connStallTimeout` (across
+    /// as many AVIO-sized reads as that takes), with a read blocked now and fewer than
+    /// `trickleFloorBytes` delivered over the last `connStallTimeout`, ends the generation.
     /// Caller holds `winCond`; records this tick's mark either way.
     private func trickleVerdictLocked() -> TrickleVerdict? {
         let now = DispatchTime.now()
@@ -3853,8 +3869,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if let keep = trickleSamples.lastIndex(where: { seconds(since: $0.at) >= connStallTimeout }), keep > 0 {
             trickleSamples.removeFirst(keep)
         }
-        guard let since = forwardWaitSince, seconds(since: since) >= connStallTimeout,
-              let mark = trickleSamples.first, seconds(since: mark.at) >= connStallTimeout else {
+        guard forwardWaitActive, let since = forwardWaitSince, seconds(since: since) >= connStallTimeout,
+              let mark = trickleSamples.first, mark.at.uptimeNanoseconds >= since.uptimeNanoseconds,
+              seconds(since: mark.at) >= connStallTimeout else {
             return nil
         }
         let span = seconds(since: mark.at)
