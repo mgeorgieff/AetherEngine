@@ -2556,13 +2556,15 @@ extension AetherEngine {
     /// wired external display), where the host's on-frame overlay cannot draw; `active == false` deselects when
     /// the video returns to fullscreen inside the app. Maps the active subtitle's source stream (embedded) or
     /// synthetic id (load-declared external, #88) to the native ordinal. No-op (no native subtitle) when the
-    /// active subtitle has no native text equivalent: a bitmap (PGS/DVB), CEA-708 (608 now rides a native
-    /// rendition, #98), or a track added after load (dynamic external / one-shot sidecar).
+    /// active subtitle has no native equivalent: CEA-708 (608 now rides a native rendition, #98), or a track
+    /// added after load (dynamic external / one-shot sidecar). A bitmap track rides its OCR-fed rendition.
+    /// On a wireless AirPlay receiver the engine raises this request itself when the host has not (AE#955).
     public func setNativeSubtitleRendering(_ active: Bool) {
         // Sodalite#156: the host's request is a STANDING one, not a one-shot. It says where the
         // picture is, and it holds until the picture comes back or the session ends, which is what
         // lets a later track pick or a subtitles-off know that the rendition is the display.
         nativeSubtitleRenderingRequested = active
+        nativeRenderingImpliedByAirPlay = false
         // #170: the AirPlay flip triggers both the engine's LAN-swap reload and the host's
         // documented rendering call; landing mid-reload the active track is transiently nil and
         // this call would be misread as a deselect. Latch the newest request instead;

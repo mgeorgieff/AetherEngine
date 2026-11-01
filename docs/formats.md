@@ -617,7 +617,7 @@ engine.setNativeSubtitleRendering(_ active: Bool)
 The recommended host pattern for PiP / AirPlay:
 
 1. Observe `$nativeSubtitleRenditionAvailable` (waits for the first cues to be ready before activating).
-2. On entering PiP / AirPlay / external display: call `setNativeSubtitleRendering(true)` (or resolve the ordinal yourself via `setNativeSubtitleSelected(track:)`), and hide the host overlay.
+2. On entering PiP / AirPlay / external display: call `setNativeSubtitleRendering(true)` (or resolve the ordinal yourself via `setNativeSubtitleSelected(track:)`), and hide the host overlay. A wireless AirPlay receiver is covered even without that call: the engine raises the request itself when the host has not, since the overlay cannot reach a receiver, and withdraws its own request when the receiver lets go (AE#955). A host call takes over either way.
 3. On leaving: call `setNativeSubtitleRendering(false)` and re-enable the host overlay.
 
 This avoids double subtitles during inline playback (where the host overlay is already painting them) and ensures the user sees subtitles the moment the stream is mirrored or sent to PiP.

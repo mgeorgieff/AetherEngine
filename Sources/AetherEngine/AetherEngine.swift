@@ -3908,6 +3908,10 @@ public final class AetherEngine: ObservableObject {
     /// missing, and they hid each other: nothing deselected, so a pick made against a standing
     /// selection looked like it had been followed.
     var nativeSubtitleRenderingRequested = false
+    /// AE#955: the standing request above was raised by the engine for a wireless AirPlay receiver,
+    /// not by the host. Only such a request is withdrawn when the receiver lets go; any host call to
+    /// `setNativeSubtitleRendering` clears this and owns the request from then on.
+    var nativeRenderingImpliedByAirPlay = false
 
     /// AE#464 round 2: the position the load currently in flight was handed, parked across the window
     /// in which `load` has already zeroed the clock but the rebuilt session has not reached it yet.
@@ -7520,6 +7524,7 @@ public final class AetherEngine: ObservableObject {
         let wantAirPlay = active && !wired
         guard wantAirPlay != airPlayActive else { return }
         airPlayActive = wantAirPlay
+        applyAirPlayImpliedNativeRendering(wirelessActive: wantAirPlay)
         // Reload so the load path rebuilds the playback URL on the LAN IP (active) or back on 127.0.0.1
         // (inactive). The remote-HLS bypass is exempt only while it plays the origin URL, which a receiver
         // reaches by itself; with a #316 subtitle proxy mounted it stands on the engine's own loopback
@@ -7533,6 +7538,38 @@ public final class AetherEngine: ObservableObject {
                        + (loadedOptions.nativeRemoteHLS ? " (remote-HLS bypass on its #316 subtitle origin)" : ""),
                        category: .engine)
         Task { try? await reloadAtCurrentPosition() }
+    }
+
+    /// AE#955: a wireless receiver is a display the host's overlay cannot reach, so the rendition is the
+    /// only subtitle it can show. A host that never called `setNativeSubtitleRendering(true)` left the
+    /// Sodalite#38 pin holding the rendition off on the receiver, and even deselecting a pick made there.
+    /// The engine raises the request itself when the host has not, and withdraws only its own.
+    private func applyAirPlayImpliedNativeRendering(wirelessActive: Bool) {
+        switch Self.airPlayImpliedRenderingAction(
+            wirelessActive: wirelessActive,
+            hostRequested: nativeSubtitleRenderingRequested,
+            impliedByEngine: nativeRenderingImpliedByAirPlay) {
+        case true?:
+            EngineLog.emit("[AirPlay] AE#955 wireless receiver is the display and the host has not asked for "
+                           + "the native rendition; requesting it on the host's behalf", category: .engine)
+            setNativeSubtitleRendering(true)
+            nativeRenderingImpliedByAirPlay = true
+        case false?:
+            EngineLog.emit("[AirPlay] AE#955 receiver let go; withdrawing the native rendition the engine "
+                           + "requested", category: .engine)
+            setNativeSubtitleRendering(false)
+        case nil:
+            break
+        }
+    }
+
+    /// AE#955: true raises the engine's own rendering request, false withdraws it, nil leaves the
+    /// host's word standing.
+    nonisolated static func airPlayImpliedRenderingAction(
+        wirelessActive: Bool, hostRequested: Bool, impliedByEngine: Bool
+    ) -> Bool? {
+        if wirelessActive { return hostRequested ? nil : true }
+        return impliedByEngine ? false : nil
     }
 
     /// A session that cannot be reopened where it is crosses an AirPlay edge by swapping the item, not by
