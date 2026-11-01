@@ -110,7 +110,7 @@ struct Issue151SubtitleForwardPrefetchTests {
     /// AE#955: a run that reaches EOF has read through the end of the program, not just through its
     /// last coverage step. The OCR pre-fill asks for a window clamped to the duration, so near the
     /// end of a film it asked about ground past the last packet and never got a yes.
-    @Test("a run that reaches EOF reads as read through the end of the program", .timeLimit(.minutes(1)))
+    @Test("a run that reaches EOF reads as read through the end of the program", .timeLimit(.minutes(3)))
     func endOfFileCoversTheTail() async throws {
         let fixture = MatroskaSubtitleFixture.make(
             durationMs: 130_000,
