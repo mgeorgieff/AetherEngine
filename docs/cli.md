@@ -282,6 +282,8 @@ live-only session took a rebuild that rejoins at the edge.
 
 `--sequential-origin` declares `LoadOptions.sequentialOrigin`, the IPTV timeshift / catch-up shape whose `206` answers are fabricated (#346): one long-lived unranged GET, no ranged probes, no tail read, so **seeking is unavailable** in the run. On VOD it needs `--declared-duration S`, which fills `LoadOptions.declaredDurationSeconds`, because the estimate that the tail read would have produced is gone with the tail read.
 
+`--skip-attachments` sets `LoadOptions.skipsContainerAttachments` (AE#956): a Matroska source opens without reading its attached files, the fonts of its ASS subtitles. The observable is the open itself: against a throttled origin and an MKV that carries fonts, the time to the first `[AetherEngine]` load line drops by the fonts' transfer time, and the `[AVIOReader]` byte counts by their size.
+
 `--held-connection` declares `LoadOptions.heldSourceConnection` (#377): the reader asks the origin
 once and pulls the whole file over that connection, instead of ending at the window high water and
 asking again every drain cycle. The observable is the range count, in the origin's own log or in the
