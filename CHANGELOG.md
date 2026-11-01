@@ -10,7 +10,11 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **`selectChapter(id:)` lands on the chapter mark.** It sought with `seek(to:)`, which on the software host's AV1
+  route may land on a keyframe up to several seconds away since 7.54.0; it now uses `seek(to:exact:)`. Every other
+  route was exact already.
 
 ## [7.54.0] - 2026-11-01
 

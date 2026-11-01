@@ -8047,7 +8047,7 @@ public final class AetherEngine: ObservableObject {
             + "(base \(String(format: "%.2f", base))s, backend \(playbackBackend))",
             category: .engine
         )
-        Task { @MainActor [weak self] in await self?.seek(to: target) }
+        Task { @MainActor [weak self] in await self?.seek(to: target, exact: true) }
     }
 
     /// Most recent sidecar subtitle URL; rehydrated by selectAudioTrack after pipeline reload. Cleared on clearSubtitle/stop.
