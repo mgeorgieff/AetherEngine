@@ -5368,14 +5368,16 @@ private func redirectPreservingHeaders(
     // origin it was budgeted against. Every fetch the reader makes passes through here, so it is
     // the one place that sees the whole chain, including the hops no response ever pins (a target
     // that answers the very first request with a 509 is never recorded as resolved).
-    if let from = task.originalRequest?.url, let to = request.url {
-        OriginRequestBudget.shared.noteRedirect(from: from, to: to)
-    }
-    return RedirectHeaderPolicy.redirectRequest(
+    // Noted after the policy so an https-upgraded hop (#954) books the origin it actually reaches.
+    let next = RedirectHeaderPolicy.redirectRequest(
         request,
         originalURL: task.originalRequest?.url,
         originalRange: task.originalRequest?.value(forHTTPHeaderField: "Range"),
         extraHeaders: extraHeaders)
+    if let from = task.originalRequest?.url, let to = next.url {
+        OriginRequestBudget.shared.noteRedirect(from: from, to: to)
+    }
+    return next
 }
 
 // MARK: - Persistent Read Delegate
