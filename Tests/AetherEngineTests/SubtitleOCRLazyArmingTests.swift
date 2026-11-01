@@ -93,6 +93,8 @@ struct SubtitleOCRLazyArmingTests {
         // The host's own request outlives the receiver; it takes it down itself.
         #expect(AetherEngine.airPlayImpliedRenderingAction(wirelessActive: false, hostRequested: true, impliedByEngine: false) == nil)
         #expect(AetherEngine.airPlayImpliedRenderingAction(wirelessActive: false, hostRequested: false, impliedByEngine: false) == nil)
+        // The remote-HLS bypass has no rendition of ours; a request there would deselect the origin's.
+        #expect(AetherEngine.airPlayImpliedRenderingAction(wirelessActive: true, servesOwnRenditions: false, hostRequested: false, impliedByEngine: false) == nil)
     }
 
     @MainActor

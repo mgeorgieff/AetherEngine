@@ -7545,8 +7545,13 @@ public final class AetherEngine: ObservableObject {
     /// Sodalite#38 pin holding the rendition off on the receiver, and even deselecting a pick made there.
     /// The engine raises the request itself when the host has not, and withdraws only its own.
     private func applyAirPlayImpliedNativeRendering(wirelessActive: Bool) {
+        // Only a session that serves its own renditions. On the remote-HLS bypass the table is empty and
+        // AVPlayer renders the origin's renditions itself, so a request here would map to no ordinal and
+        // deselect exactly the subtitle the receiver is showing.
+        let servesOwnRenditions = !loadedOptions.nativeRemoteHLS && !nativeSubtitleTrackTable.isEmpty
         switch Self.airPlayImpliedRenderingAction(
             wirelessActive: wirelessActive,
+            servesOwnRenditions: servesOwnRenditions,
             hostRequested: nativeSubtitleRenderingRequested,
             impliedByEngine: nativeRenderingImpliedByAirPlay) {
         case true?:
@@ -7555,6 +7560,12 @@ public final class AetherEngine: ObservableObject {
             setNativeSubtitleRendering(true)
             nativeRenderingImpliedByAirPlay = true
         case false?:
+            guard servesOwnRenditions else {
+                // A later load moved onto the bypass; there is no rendition of ours left to take down.
+                nativeSubtitleRenderingRequested = false
+                nativeRenderingImpliedByAirPlay = false
+                return
+            }
             EngineLog.emit("[AirPlay] AE#955 receiver let go; withdrawing the native rendition the engine "
                            + "requested", category: .engine)
             setNativeSubtitleRendering(false)
@@ -7566,9 +7577,9 @@ public final class AetherEngine: ObservableObject {
     /// AE#955: true raises the engine's own rendering request, false withdraws it, nil leaves the
     /// host's word standing.
     nonisolated static func airPlayImpliedRenderingAction(
-        wirelessActive: Bool, hostRequested: Bool, impliedByEngine: Bool
+        wirelessActive: Bool, servesOwnRenditions: Bool = true, hostRequested: Bool, impliedByEngine: Bool
     ) -> Bool? {
-        if wirelessActive { return hostRequested ? nil : true }
+        if wirelessActive { return hostRequested || !servesOwnRenditions ? nil : true }
         return impliedByEngine ? false : nil
     }
 
