@@ -74,7 +74,14 @@ extension AetherEngine {
     func selectSubtitleTrack(index: Int, startAt: Double) {
         // Phase D: every selection change disarms the OCR worker first; the embedded bitmap
         // branch below re-arms it (cursors persist, so a reselect resumes coverage).
-        cancelSubtitleOCRWorker()
+        // AE#955: except a re-pick of the track the worker already serves. Cancelling it there
+        // threw away the batch in flight and its cursor, and a host that re-asserts its pick next to
+        // `setNativeSubtitleRendering(true)` restarted recognition on every call.
+        let keepsOCRWorker = Self.subtitleOCRWorkerSurvivesPick(
+            armedOrdinal: subtitleOCRArmedOrdinal,
+            pickedOrdinal: Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
+            pickIsEmbedded: index < Self.externalSubtitleTrackIDBase)
+        if !keepsOCRWorker { cancelSubtitleOCRWorker() }
         // #316: an external track the remote-HLS proxy declared as a rendition is rendered by AVPlayer
         // itself, so it must NOT also start a sidecar decode; the overlay would draw the same cues a
         // second time, and only the rendition survives PiP / AirPlay / an external display.
@@ -134,7 +141,7 @@ extension AetherEngine {
         // only while the host is showing that rendition (PiP / AirPlay / external display). Armed
         // BEFORE the prefetcher start so the raised lead is picked up. Otherwise the native-selection
         // path arms it on demand (`syncSubtitleOCRWithNativeSelection`).
-        if nativeSubtitleRenderingRequested,
+        if nativeSubtitleRenderingRequested, !keepsOCRWorker,
            let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: index, in: nativeSubtitleTrackTable),
            nativeSubtitleTrackTable[ordinal].needsOCR {
             startSubtitleOCRWorker(ordinal: ordinal, streamIndex: Int32(index))
@@ -147,6 +154,15 @@ extension AetherEngine {
             + "(backfill requested)",
             category: .engine
         )
+    }
+
+    /// AE#955: whether a subtitle pick leaves the OCR worker running. Only a pick of the embedded
+    /// track it is already armed for; anything else disarms it and lets the pick re-arm.
+    nonisolated static func subtitleOCRWorkerSurvivesPick(
+        armedOrdinal: Int?, pickedOrdinal: Int?, pickIsEmbedded: Bool
+    ) -> Bool {
+        guard pickIsEmbedded, let armedOrdinal else { return false }
+        return armedOrdinal == pickedOrdinal
     }
 
     /// Apply `LoadOptions.initialSubtitleTrackID`, else `LoadOptions.preferredSubtitleLanguages`, at the end of a

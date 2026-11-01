@@ -70,4 +70,17 @@ struct SubtitleOCRLazyArmingTests {
         #expect(!AetherEngine.subtitleOCRWindowCovered(harvestRead: false, undecodedPackets: 0))
         #expect(!AetherEngine.subtitleOCRWindowCovered(harvestRead: true, undecodedPackets: 2))
     }
+
+    // AE#955: a host re-asserting its pick next to `setNativeSubtitleRendering(true)` restarted the
+    // worker on every call, and a restart with a batch in flight drops that batch's cursor, so the
+    // pre-fill gate waited on coverage that kept being thrown away.
+    @Test("re-picking the armed track keeps the worker, any other pick re-arms")
+    func rePickKeepsTheWorker() {
+        #expect(AetherEngine.subtitleOCRWorkerSurvivesPick(armedOrdinal: 1, pickedOrdinal: 1, pickIsEmbedded: true))
+        #expect(!AetherEngine.subtitleOCRWorkerSurvivesPick(armedOrdinal: 1, pickedOrdinal: 0, pickIsEmbedded: true))
+        #expect(!AetherEngine.subtitleOCRWorkerSurvivesPick(armedOrdinal: nil, pickedOrdinal: 1, pickIsEmbedded: true))
+        #expect(!AetherEngine.subtitleOCRWorkerSurvivesPick(armedOrdinal: 1, pickedOrdinal: nil, pickIsEmbedded: true))
+        // An external .sup shares no worker with an embedded track, whatever its ordinal says.
+        #expect(!AetherEngine.subtitleOCRWorkerSurvivesPick(armedOrdinal: 1, pickedOrdinal: 1, pickIsEmbedded: false))
+    }
 }
