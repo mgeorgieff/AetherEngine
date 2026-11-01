@@ -1179,6 +1179,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
+            .skippingAttachments()
             .withSourceOpenPolicy(sourceOpenPolicy)
             .withDiagnosticContext(diagnosticContext)
         self.dvModeAvailable = dvModeAvailable

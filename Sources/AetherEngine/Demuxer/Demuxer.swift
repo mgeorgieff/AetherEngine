@@ -70,6 +70,11 @@ struct DemuxerOpenProfile: Sendable {
     /// the one shape a held connection must not take.
     var avioHeldConnection: Bool = false
 
+    /// AE#956: open a Matroska source without reading its attachments (`skip_attachments`). The
+    /// session's probe demuxer is the only open whose attachments anything reads (fonts, cover art),
+    /// so it follows `LoadOptions.skipsContainerAttachments`; side readers and reopens always skip.
+    var skipsAttachments: Bool = false
+
     /// `LoadOptions.declaredDurationSeconds`: caller-trusted duration override consumed by
     /// `Demuxer.duration`. Rides in the profile next to `avioSequentialOnly` because the two are a
     /// pair: without the ranged tail read the container resolves no duration of its own.
@@ -138,6 +143,7 @@ struct DemuxerOpenProfile: Sendable {
         avioRequestTimeout: 8,
         avioMaxRetries: 1,
         skipStreamInfo: false,
+        skipsAttachments: true,
         readerLabel: "extract",
         auditsRecordlessDolbyVision: false
     )
@@ -184,6 +190,14 @@ struct DemuxerOpenProfile: Sendable {
         return copy
     }
 
+    /// A copy of `self` that does or does not read Matroska attachments (AE#956), chainable like
+    /// `withHeldSourceConnection`.
+    func skippingAttachments(_ skip: Bool = true) -> DemuxerOpenProfile {
+        var copy = self
+        copy.skipsAttachments = skip
+        return copy
+    }
+
     /// Open profile for the #79 wedged-restart fresh reopen (#93 residual). The 44 s device
     /// restart was find_stream_info re-paying the FULL playback probe budget (50 MB / 60 s)
     /// over an already-starved link, so the reopen shrinks the budget instead of skipping the
@@ -204,6 +218,7 @@ struct DemuxerOpenProfile: Sendable {
         // margin for the AVIO buffer straddling the 4 MB boundary). The producer reconnects
         // open-ended at the seek target immediately after, so sustained reads are untouched.
         profile.boundedInitialFetch = 8 * 1024 * 1024
+        profile.skipsAttachments = true
         return profile
     }()
 
@@ -226,6 +241,7 @@ struct DemuxerOpenProfile: Sendable {
         let analyze = min(callerMaxAnalyzeDuration ?? analyzeCeiling, analyzeCeiling)
         var profile = playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: analyze)
         profile.skipStreamInfo = true
+        profile.skipsAttachments = true
         profile.readerLabel = "subs"
         return profile
     }
@@ -729,7 +745,7 @@ public final class Demuxer: @unchecked Sendable {
 
         let urlString = url.isFileURL ? url.path : url.absoluteString
         var opts: OpaquePointer? = nil
-        Self.applyDemuxerOptions(&opts)
+        Self.applyDemuxerOptions(&opts, skipAttachments: openProfile.skipsAttachments)
         let ret = avformat_open_input(&ctx, urlString, nil, &opts)
         av_dict_free(&opts)
         guard ret == 0, let openedCtx = ctx else {
@@ -1023,7 +1039,8 @@ public final class Demuxer: @unchecked Sendable {
         var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
         var opts: OpaquePointer? = nil
         Self.applyDemuxerOptions(&opts, isLive: isLive,
-                                 skipDurationEstimate: openProfile.avioSequentialOnly)
+                                 skipDurationEstimate: openProfile.avioSequentialOnly,
+                                 skipAttachments: openProfile.skipsAttachments)
         let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
@@ -1133,8 +1150,12 @@ public final class Demuxer: @unchecked Sendable {
     /// (3.24 MB/s -> ~1.7 MB/s). Tried+reverted: +sortdts (worse RSS), +discardcorrupt
     /// (worse RSS), +igndts (AetherEngine#5: matroska still emits dts=0 on HEVC open-GOP
     /// CRA B-frames, NOPTS repair stack stayed load-bearing).
-    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false, skipDurationEstimate: Bool = false) {
+    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false, skipDurationEstimate: Bool = false, skipAttachments: Bool = false) {
         av_dict_set(&opts, "fflags", "+genpts", 0)
+        if skipAttachments {
+            // AE#956: matroskadec's skip_attachments (FFmpegBuild patch); other demuxers ignore it.
+            av_dict_set(&opts, "skip_attachments", "1", 0)
+        }
         if isLive || skipDurationEstimate {
             // Live sources have no Content-Length; stream-info pass seeks SEEK_END,
             // which latches pb->eof_reached and collapses av_read_frame ~10s in.

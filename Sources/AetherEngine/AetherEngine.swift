@@ -4790,6 +4790,7 @@ public final class AetherEngine: ObservableObject {
                     .withSequentialOrigin(options.sequentialOrigin,
                                           declaredDuration: options.declaredDurationSeconds)
                     .withHeldSourceConnection(options.heldSourceConnection)
+                    .skippingAttachments(options.skipsContainerAttachments)
                     .withSourceOpenPolicy(options.sourceOpenPolicy)
                     .withDiagnosticContext(options.sourceDiagnosticsContext)
                     .withRequestHeaders(requestHeaders)

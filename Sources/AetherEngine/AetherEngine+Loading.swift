@@ -2222,7 +2222,7 @@ extension AetherEngine {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy).withDiagnosticContext(diagnosticContext).withRequestHeaders(requestHeaders), isLive: isLive)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).skippingAttachments().withSourceOpenPolicy(sourceOpenPolicy).withDiagnosticContext(diagnosticContext).withRequestHeaders(requestHeaders), isLive: isLive)
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -2309,7 +2309,7 @@ extension AetherEngine {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy).withDiagnosticContext(diagnosticContext).withRequestHeaders(requestHeaders))
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).skippingAttachments().withSourceOpenPolicy(sourceOpenPolicy).withDiagnosticContext(diagnosticContext).withRequestHeaders(requestHeaders))
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -2606,6 +2606,7 @@ extension AetherEngine {
         // Preserve the caller's probe budget (#68) across the reopen so an audio/title switch doesn't re-incur the full find_stream_info cost the caller paid to avoid.
         let reloadProfile = DemuxerOpenProfile.playback.withProbeBudget(
             probesize: loadedOptions.probesize, maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration)
+            .skippingAttachments()
             .withSourceOpenPolicy(loadedOptions.sourceOpenPolicy)
             .withDiagnosticContext(loadedOptions.sourceDiagnosticsContext)
         var customPreopened: Demuxer? = nil
