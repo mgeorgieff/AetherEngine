@@ -12,6 +12,15 @@ the public-API contract.
 
 ### Fixed
 
+- **A subtitle side reader on a Matroska source no longer stops at second 0 after a deadline-cut positioning
+  (#944).** When the timestamp seek ran out of budget, libavformat's generic fallback read into the cut and the
+  matroska demuxer latched end of stream in its private `done` flag, which only its own `read_seek` cleared. The
+  byte-estimate reposition that follows never reaches `read_seek`, so the first read after it returned EOF: the
+  forward prefetch exited as `endOfFile` with nothing harvested and was not restarted, leaving cues ahead of the
+  playhead to the pump for the rest of the session. FFmpegBuild 3.12.1 makes the demuxer honour
+  `io_repositioned` after any byte or generic seek (submitted upstream as FFmpeg PR 25665).
+  `Issue944LatchedReadErrorTests` gains the Matroska case, which reads 0 of 20 packets on 3.12.0.
+
 - **`selectChapter(id:)` lands on the chapter mark.** It sought with `seek(to:)`, which on the software host's AV1
   route may land on a keyframe up to several seconds away since 7.54.0; it now uses `seek(to:exact:)`. Every other
   route was exact already.
