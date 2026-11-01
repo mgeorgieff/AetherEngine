@@ -267,8 +267,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// False for a Dolby Vision Profile 5 / 10.0 source in a build without the
     /// `DolbyVisionStillReshaping` trait: none of its frames can become a correct still.
     private(set) var yieldsStills = true
-    /// Dolby Vision without a displayable base layer (Profile 5, AV1 Profile 10.0): only the system
-    /// compositor shows it in colour, so scrub previews go through `compositorPreviewFile`.
+    /// Dolby Vision without a displayable base layer (Profile 5, AV1 Profile 10.0) in a build without
+    /// the `DolbyVisionStillReshaping` trait: only the system compositor shows it in colour, so scrub
+    /// previews go through `compositorPreviewFile`. With the trait those sources take the still path.
     private(set) var previewNeedsCompositor = false
     private let compositorPreviewLock = NSLock()
     private var compositorPreviewFiles: [(identity: String, file: CompositorPreviewFile)] = []
@@ -2505,7 +2506,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let stillsAvailable = FrameDecodeContext.yieldsStill(
             dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
         yieldsStills = stillsAvailable
-        previewNeedsCompositor = FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar)
+        previewNeedsCompositor = !stillsAvailable
         if !stillsAvailable {
             EngineLog.emit("[HLSVideoEngine] Dolby Vision Profile 5 / 10.0 stills are not built in "
                            + "(DolbyVisionStillReshaping trait off): no scrub thumbnails or I-frame stills; "

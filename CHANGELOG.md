@@ -10,6 +10,14 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Changed
+
+- **With the `DolbyVisionStillReshaping` trait, a Dolby Vision Profile 5 / 10.0 session scrubs through the
+  reshaped still path again.** `scrubPreviewDrawsInView` is now true only in a build without the trait, so a host
+  that enables it gets `scrubThumbnail` stills, the keyframe still ladder and the I-frame rendition for those
+  sources like for any other, and the held picture keeps using the same reshaping. Without the trait nothing
+  changes: previews and the held picture still go through the system compositor.
+
 ### Fixed
 
 - **A subtitle side reader on a Matroska source no longer stops at second 0 after a deadline-cut positioning
