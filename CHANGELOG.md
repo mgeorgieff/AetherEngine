@@ -16,6 +16,18 @@ the public-API contract.
   route may land on a keyframe up to several seconds away since 7.54.0; it now uses `seek(to:exact:)`. Every other
   route was exact already.
 
+- **An https source that redirects to plain http on a public host is followed over https.** App Transport
+  Security refuses the http hop before a byte moves (`-1022`), every reopen meets the same refusal, and once the
+  opening budget runs out the load fails as `sourceOpenFailed` / `-1004` with "Source did not respond within the
+  opening budget", which reads as a slow server. A media server behind a TLS-terminating proxy builds exactly this
+  link when it derives its public address from the inner http request: a Jellyfin-compatible add-on bridge
+  answered `https://host/Videos/{id}/stream.mkv` with a 302 to `http://host/...` on the same host, and the same
+  stream played in players with their own HTTP stack. `RedirectHeaderPolicy.redirectRequest` now asks for the
+  target over https (port 80 dropped) when the original request was https and the target is a public name. Local
+  names and IP literals keep the redirect as sent, and so does any host the app's ATS configuration already
+  allows over http (`NSExceptionDomains`, or `NSAllowsArbitraryLoads` where the system honors it). The upgraded
+  target is the same origin, so a same-host hop keeps its credentials.
+
 ## [7.54.0] - 2026-11-01
 
 ### Added
