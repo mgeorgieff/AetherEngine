@@ -10,6 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.54.0] - 2026-11-01
+
+### Added
+
+- **`seek(to:exact:)`**, for a seek that must land on its target (a chapter mark, the end of an intro) where `seek(to:)`
+  may now snap AV1 on the software host to a keyframe (PR #943, details under Fixed).
+
 ### Fixed
 
 - **The low-resolution upscale route stays off on any AirPlay route, and a stage that switched itself
@@ -112,6 +121,28 @@ the public-API contract.
   ahead, and a keyframe both the packet cache and the index list keeps the cache's value: the index converts ticks in
   another order and sat one bit lower for about one keyframe in five at a 1/24000 time base, which made the cache hit
   restore to the keyframe before it.
+
+- **A backward seek into a stretch a forward seek skipped no longer loses its bitmap subtitles (#941).**
+  A forward seek past the producer's front followed by a backward seek into the skipped stretch lost every PGS set
+  between the landing and the forward run's island on a link near the media bitrate. The harvest-gap hold now also
+  consults the coverage ledger, so a span nobody read counts as a hole even when the harvest order ascends across it;
+  the pump's reach claim is skipped while a seek is in flight, so it no longer stretches the re-anchored run across the
+  skipped ground; and the hold releases when the playhead closes on the far side of the hole instead of the last packet
+  before it. A 300 s fixture with a set every 3 s behind a 13.5 Mbit/s origin (play 30 to 40, seek 70, seek 40) lost
+  the sets at 51 and 54 s in 3 of 3 runs; now all 18 sets in the played range appear, each 2 to 4 s ahead of its start.
+
+- **A read error latched by a cut side read no longer poisons every later read (#944).** A read the positioning
+  deadline cut left `eof_reached` and `error` set on the AVIO context; `avio_seek`'s short forward path gave up on the
+  stale flag, the byte-estimate fallback reported success anyway, and every following read replayed the stored error
+  ("Operation not permitted") until the forward prefetcher gave up for the session. Every byte-space reposition now
+  clears both fields first, the deadline-bounded ones clear them again afterwards, and the landing probe tells a read
+  failure from EOF, so such a fallback reports failed instead of applied.
+
+- **A fastZap live start ends its grace when no further segment can finish in it (#936).** On a long GOP after an
+  upstream burst the bounded start waited up to 2 s for a segment that could not come and then served the same window.
+  The gate now ends the grace once the open segment cannot reach the shortest segment seen so far at the measured
+  delivery rate. `aetherctl live --fast-zap --realtime` on a 5 s GOP after a 20 s burst: serve 2.0 s down to 0.7 s,
+  first picture 2.4 to 2.6 s down to 1.1 to 1.2 s, same window; 1 s GOPs unchanged.
 
 ## [7.53.1] - 2026-10-31
 
