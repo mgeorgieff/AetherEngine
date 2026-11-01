@@ -384,6 +384,10 @@ struct ItemSwapStillTests {
         try await waitFor { host.isVideoReadyForDisplay }
         try await Task.sleep(for: .seconds(1))
         engine.pause()
+        // Scrubbing takes the reshaped still path, not the compositor preview.
+        #expect(engine.supportsCacheBackedStills)
+        #expect(!engine.scrubPreviewDrawsInView)
+        #expect(await engine.scrubThumbnail(atSeconds: 0.5, maxWidth: 160) != nil)
         let started = ContinuousClock.now
         await engine.holdPictureAcrossItemSwap()
         #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds))
