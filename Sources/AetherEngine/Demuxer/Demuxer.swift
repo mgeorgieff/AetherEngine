@@ -435,6 +435,14 @@ public final class Demuxer: @unchecked Sendable {
         didSet { (avioProvider as? AVIOReader)?.onNetworkPhaseChanged = onNetworkPhaseChanged }
     }
 
+    /// The source's average byte rate, forwarded to the network reader so a connection delivering
+    /// far below what playback needs while a read starves is replaced early (rate trickle, see
+    /// `AVIOReader.rateTrickleSeconds`). nil turns it off. A no-op for disc / custom / file
+    /// providers, which have no `AVIOReader`, and for a live reader, which ignores it.
+    func setSourcePlaybackByteRate(_ bytesPerSecond: Int64?) {
+        (avioProvider as? AVIOReader)?.setPlaybackByteRate(bytesPerSecond)
+    }
+
     /// Passed to the source reader so a held connection can tell a parked producer from a paused
     /// viewer. Same provider the segment producer reads. `didSet` re-forwards for the same reason
     /// `onNetworkPhaseChanged` does: it may be set before or after `open()`.

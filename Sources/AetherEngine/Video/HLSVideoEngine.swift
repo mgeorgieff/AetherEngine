@@ -1479,6 +1479,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 throw HLSVideoEngineError.zeroDuration
             }
             sourceBitrate = dem.bitRate
+            // The source reader holds a starved read's connection to this rate (rate trickle).
+            dem.setSourcePlaybackByteRate(sourceBitrate > 0 ? sourceBitrate / 8 : nil)
 
             // #409: settle the composition-offset repair while the demuxer still stands at the head.
             // It reads a short sample and holds those packets, so nothing is consumed; doing it later
@@ -5029,6 +5031,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             dem.onNetworkPhaseChanged = nil
             freshDemuxer.onNetworkPhaseChanged = onNetworkPhaseChanged   // re-wire stall signal onto the reopened demuxer (#85)
             freshDemuxer.playIntentProvider = playIntentProvider   // and the pause bound its held connection is judged on (#377)
+            freshDemuxer.setSourcePlaybackByteRate(sourceBitrate > 0 ? sourceBitrate / 8 : nil)   // and the rate its starved reads are held to
         }
         do {
             let newProd = try makeProducer(baseIndex: idx)

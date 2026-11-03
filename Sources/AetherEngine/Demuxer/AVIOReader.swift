@@ -698,6 +698,26 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// 0.8 Mbit/s, far below any video bitrate and far above the field case's 256 KB per 40-100 s.
     /// A reader with a shorter `connStallTimeout` scales it by the same ratio (see the init).
     static let trickleFloorBytesDefault: Int64 = 2 * 1024 * 1024
+    /// Rate trickle, judged only once a host has told the reader the playback byte rate
+    /// (`setPlaybackByteRate`). The floor above is sized for a drip; a connection carrying well
+    /// above it and far below the video's rate starves the consumer just the same. Field case: 4K DV
+    /// at 25.4 Mbit/s average over a held debrid connection slowed to a few Mbit/s, reads waited 2 to
+    /// 6 s each, AVPlayer stalled, and only the gap path ended it after about 70 s; the replacement
+    /// delivered its first byte in 2.5 s. A consumer starved this long on forward data, with the
+    /// connection delivering less than `rateTrickleFraction` of the playback rate over that span,
+    /// ends the generation. All three durations scale with `connStallTimeout` like the floor does.
+    static let rateTrickleSeconds: TimeInterval = 8
+    /// Fraction of the playback byte rate below which a starved stretch is a rate trickle. Half,
+    /// so a connection that merely runs a little under the average (a high-bitrate scene on an
+    /// origin that keeps up overall) is left to the window.
+    static let rateTrickleFraction = 0.5
+    /// Watchdog tick while a read is starved and the rate is known, so the rule above is evaluated
+    /// about this often instead of once per remaining stall period.
+    static let rateTrickleTick: TimeInterval = 2
+    /// Least time between two rate-trickle ends on one reader. An origin that is slow on every
+    /// connection is then still replaced, but no more often than this; the floor and the gap path
+    /// keep their own pacing in between.
+    static let rateTrickleMinInterval: TimeInterval = 30
     /// #450: fraction of the stall threshold at which a generation that has seen no first byte is
     /// REPORTED. Derived from the threshold rather than set beside it so the invariant holds at
     /// every value of the threshold, the shortened ones tests run with included: the witness speaks
@@ -874,6 +894,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return trickleEnds
     }
 
+    /// How many of `trickleEndCountForTesting` the rate rule ended.
+    var rateTrickleEndCountForTesting: Int {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return rateTrickleEnds
+    }
+
     var deliveryGapSecondsForTesting: Double {
         winCond.lock()
         defer { winCond.unlock() }
@@ -992,6 +1019,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// stopped reading (a paused player) is never judged on a clock it left running.
     private var forwardWaitActive = false
     private var trickleEnds = 0
+    /// Rate-trickle inputs, winCond-guarded. `playbackByteRate` is nil until a host sets it (and
+    /// stays nil on a live reader); `lastRateTrickleEndAt` spans generations on purpose, it paces
+    /// the rule across replacements (`rateTrickleMinInterval`).
+    private var playbackByteRate: Int64?
+    private var lastRateTrickleEndAt: DispatchTime?
+    private var rateTrickleEnds = 0
+    /// The delivery-gap watchdog's pending tick: its token and when it fires. A tick armed with a
+    /// newer token supersedes the pending one, which then returns without acting, so the read loop
+    /// can bring the next tick forward while staying at one live closure per generation.
+    /// winCond-guarded.
+    private var deliveryGapTickToken = 0
+    private var deliveryGapTickDue = DispatchTime(uptimeNanoseconds: 0)
 
     /// #309: earliest time the read loop may replace a FAULTED connection from the serve path.
     /// The failure ladder there cannot sleep (see `chargeFaultedRunwayRefill`), so its backoff is
@@ -1231,6 +1270,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// trickle. `trickleFloorBytesDefault` scaled to this reader's stall threshold unless a caller
     /// overrides it.
     private let trickleFloorBytes: Int64
+    /// `rateTrickleSeconds`, `rateTrickleTick` and `rateTrickleMinInterval` scaled to this reader's
+    /// stall threshold by the ratio `trickleFloorBytes` uses, never above the shipped values.
+    /// Internal so tests can state their timing in the reader's own terms.
+    let rateTrickleWindowSeconds: TimeInterval
+    let rateTrickleTickSeconds: TimeInterval
+    let rateTrickleMinIntervalSeconds: TimeInterval
     /// #450: when this reader reports a generation that is on the link with nothing delivered.
     private var firstByteWitnessDelay: TimeInterval {
         min(Self.firstByteWitnessMaxSeconds, connStallTimeout * Self.firstByteWitnessFraction)
@@ -1288,6 +1333,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.connStallTimeout = max(0.05, connStallTimeout)
         self.trickleFloorBytes = max(1, trickleFloorBytes ?? Int64(
             Double(Self.trickleFloorBytesDefault) * self.connStallTimeout / Self.connStallTimeoutDefault))
+        let stallScale = self.connStallTimeout / Self.connStallTimeoutDefault
+        self.rateTrickleWindowSeconds = min(Self.rateTrickleSeconds, Self.rateTrickleSeconds * stallScale)
+        self.rateTrickleTickSeconds = min(Self.rateTrickleTick, Self.rateTrickleTick * stallScale)
+        self.rateTrickleMinIntervalSeconds = min(Self.rateTrickleMinInterval,
+                                                 Self.rateTrickleMinInterval * stallScale)
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
         self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
@@ -2776,6 +2826,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 }
                 enteredForwardWait = true
                 forwardWaitActive = true
+                // The pending gap tick can be most of a stall period away; with the rate known, bring
+                // it forward so the rate rule is judged on its own cadence while this read starves.
+                // Still only a tick: it can end the generation, the replacement stays with this loop.
+                if rateTrickleEnabledLocked, !connEnded, activeTransfer != nil {
+                    let soon = DispatchTime.now() + rateTrickleTickSeconds
+                    if deliveryGapTickDue > soon {
+                        armDeliveryGapWatchdogLocked(generation: connGeneration, after: rateTrickleTickSeconds)
+                    }
+                }
                 let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: connStallTimeout), readDeadline))
                 winCond.unlock()
                 diag.recordStallWait(ms: msSince(waitStart), signaled: signaled)
@@ -3685,11 +3744,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return
         }
         activeTransfer = transfer
+        // #309: from here the generation is watched on wall-clock time, not on consumer cadence.
+        // Armed under the lock that installs the transfer, so a read already starved on it brings
+        // the next tick forward (rate trickle) after this, never before it.
+        armDeliveryGapWatchdogLocked(generation: generation, after: connStallTimeout)
         winCond.unlock()
 
         transfer.startTransfer()
-        // #309: from here the generation is watched on wall-clock time, not on consumer cadence.
-        armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
         armFirstByteWitness(generation: generation, originURL: requestURLForBudget)
         // #240: not DEBUG-only any more, and it names its reader. This is the line a field report
         // needs to answer "who is on the link": with bounded ranges every 32 MiB refill starts a
@@ -3752,15 +3813,32 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             category: .demux)
     }
 
-    /// #309: schedule the delivery-gap check for `generation`. One pending closure at a time per
+    /// #309: schedule the delivery-gap check for `generation`. One live closure at a time per
     /// generation: it either ends the connection or re-arms itself for the remaining gap, so a
     /// healthy transfer costs one comparison per `connStallTimeout` instead of a repeating timer,
-    /// and a generation that has already ended arms nothing at all.
-    private func armDeliveryGapWatchdog(generation: Int, after delay: TimeInterval) {
+    /// and a generation that has already ended arms nothing at all. Caller holds `winCond`; arming
+    /// supersedes whatever tick is pending (see `deliveryGapTickToken`).
+    private func armDeliveryGapWatchdogLocked(generation: Int, after delay: TimeInterval) {
+        deliveryGapTickToken &+= 1
+        let token = deliveryGapTickToken
+        deliveryGapTickDue = DispatchTime.now() + delay
         Self.deliveryGapQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            self?.checkDeliveryGap(generation: generation)
+            self?.checkDeliveryGap(generation: generation, token: token)
         }
     }
+
+    /// The video's average byte rate, so a starved read can be judged against what playback needs
+    /// (`rateTrickleSeconds`). nil or non-positive turns the rule off, and a live reader ignores it:
+    /// a live feed arrives at the producer's pace, which is not a rate it can be held to.
+    func setPlaybackByteRate(_ bytesPerSecond: Int64?) {
+        guard !isLive else { return }
+        winCond.lock()
+        playbackByteRate = bytesPerSecond.flatMap { $0 > 0 ? $0 : nil }
+        winCond.unlock()
+    }
+
+    /// Caller holds `winCond`.
+    private var rateTrickleEnabledLocked: Bool { (playbackByteRate ?? 0) > 0 }
 
     /// #309: end a generation that has an installed transfer and no delivery for
     /// `connStallTimeout`. Same threshold and same action as the read loop's forward wait, with the
@@ -3772,12 +3850,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// consumer cannot be turned into a timer-driven reconnect loop (the #307 failure mode), and a
     /// pause continues to hold no flow at all (the #310 invariant). The replacement is issued by
     /// the read loop: at low water while read-ahead remains, immediately once the window is empty.
-    private func checkDeliveryGap(generation: Int) {
+    private func checkDeliveryGap(generation: Int, token: Int) {
         if isClosed { return }
         winCond.lock()
         // Nothing to watch: a newer generation owns the link, the connection already ended
-        // (delivered range, high-water end, transport error), or no transfer is installed.
-        guard generation == connGeneration, !connEnded, let transfer = activeTransfer else {
+        // (delivered range, high-water end, transport error), no transfer is installed, or a newer
+        // tick superseded this one (it carries the watch from here).
+        guard generation == connGeneration, !connEnded, let transfer = activeTransfer,
+              token == deliveryGapTickToken else {
             winCond.unlock()
             return
         }
@@ -3785,8 +3865,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // (`SourceOpenPolicy`), which a host sets longer than the stall threshold for an origin that
         // is slow to answer. Ending it here cut both open attempts at the threshold instead.
         if openAwaitedGeneration == generation, !connFirstDataSeen {
+            armDeliveryGapWatchdogLocked(generation: generation, after: connStallTimeout)
             winCond.unlock()
-            armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
             return
         }
         let gap = Double(DispatchTime.now().uptimeNanoseconds - lastDeliveryAt.uptimeNanoseconds)
@@ -3809,8 +3889,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // Same for the trickle marks: a park is not a slow stretch.
             trickleSamples = [(lastDeliveryAt, genDeliveredBytes)]
             forwardWaitSince = nil   // a full window is not a starved consumer
+            armDeliveryGapWatchdogLocked(generation: generation, after: connStallTimeout)
             winCond.unlock()
-            armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
             return
         }
         if gap < connStallTimeout {
@@ -3818,9 +3898,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 endTrickleLocked(generation: generation, transfer: transfer, verdict: trickle)
                 return
             }
+            // Data landed since this closure was scheduled; wait out what is left of the window,
+            // or only one rate tick while a read starves and the rate rule has something to judge.
+            // Armed before the unlock so a tick the read loop brings forward cannot be superseded
+            // by this slower one.
+            var delay = max(0.02, connStallTimeout - gap)
+            if rateTrickleEnabledLocked, forwardWaitActive { delay = min(delay, rateTrickleTickSeconds) }
+            armDeliveryGapWatchdogLocked(generation: generation, after: delay)
             winCond.unlock()
-            // Data landed since this closure was scheduled; wait out what is left of the window.
-            armDeliveryGapWatchdog(generation: generation, after: max(0.02, connStallTimeout - gap))
             return
         }
         connEnded = true
@@ -3847,6 +3932,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let span: Double
         let waited: Double
         let offset: Int64
+        /// Set when the rate rule decided it: the playback byte rate the span was held to.
+        var playbackRate: Int64? = nil
     }
 
     /// The gap watchdog measures only the time since the LAST delivery, so a drip defeats it: in the
@@ -3857,6 +3944,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// This judges VOLUME instead: a consumer starved on forward data for `connStallTimeout` (across
     /// as many AVIO-sized reads as that takes), with a read blocked now and fewer than
     /// `trickleFloorBytes` delivered over the last `connStallTimeout`, ends the generation.
+    /// With a playback rate set, a shorter rule runs first (`rateTrickleSeconds`): starved for
+    /// `rateTrickleWindowSeconds` and delivering under `rateTrickleFraction` of the playback rate
+    /// over that span, no sooner than `rateTrickleMinIntervalSeconds` after the last such end.
     /// Caller holds `winCond`; records this tick's mark either way.
     private func trickleVerdictLocked() -> TrickleVerdict? {
         let now = DispatchTime.now()
@@ -3868,6 +3958,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // Keep the newest mark that is at least one period old, and everything after it.
         if let keep = trickleSamples.lastIndex(where: { seconds(since: $0.at) >= connStallTimeout }), keep > 0 {
             trickleSamples.removeFirst(keep)
+        }
+        // The rate rule's window is shorter than one period, so the pruning above never drops the
+        // mark it needs. Marks start at the generation's start and again at the starved clock's, so
+        // the `since` bound below also keeps a previous generation out of the span.
+        if let rate = playbackByteRate, rate > 0, forwardWaitActive, let since = forwardWaitSince,
+           seconds(since: since) >= rateTrickleWindowSeconds,
+           lastRateTrickleEndAt.map({ seconds(since: $0) >= rateTrickleMinIntervalSeconds }) ?? true,
+           let mark = trickleSamples.last(where: {
+               seconds(since: $0.at) >= rateTrickleWindowSeconds
+                   && $0.at.uptimeNanoseconds >= since.uptimeNanoseconds
+           }) {
+            let span = seconds(since: mark.at)
+            let delivered = bytes - mark.bytes
+            if Double(delivered) / span < Self.rateTrickleFraction * Double(rate) {
+                return TrickleVerdict(bytes: delivered, span: span, waited: seconds(since: since),
+                                      offset: forwardWaitOffset, playbackRate: rate)
+            }
         }
         guard forwardWaitActive, let since = forwardWaitSince, seconds(since: since) >= connStallTimeout,
               let mark = trickleSamples.first, mark.at.uptimeNanoseconds >= since.uptimeNanoseconds,
@@ -3889,10 +3996,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connEnded = true
         activeTransfer = nil
         trickleEnds += 1
+        if verdict.playbackRate != nil {
+            rateTrickleEnds += 1
+            lastRateTrickleEndAt = DispatchTime.now()
+        }
         winCond.broadcast()
         winCond.unlock()
         transfer.cancelTransfer()
         transfer.releaseOriginTicket()   // #377: a trickling connection must not hold the slot
+        if let rate = verdict.playbackRate {
+            let kbps = verdict.span > 0 ? Double(verdict.bytes) / verdict.span / 1024 : 0
+            EngineLog.emit(
+                "[AVIOReader] \(label) gen=\(generation) rate trickle: \(Int(kbps)) KB/s over "
+                + "\(String(format: "%.1f", verdict.span))s vs playback \(rate / 1024) KB/s while a read waited "
+                + "\(String(format: "%.1f", verdict.waited))s at offset \(verdict.offset); ending it",
+                category: .demux)
+            return
+        }
         EngineLog.emit(
             "[AVIOReader] \(label) gen=\(generation) trickle: \(verdict.bytes / 1024) KB in "
             + "\(String(format: "%.1f", verdict.span))s while a read waited "

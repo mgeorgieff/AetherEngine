@@ -199,11 +199,14 @@ struct TrickleWatchdogTests {
     }
 
     private static func makeReader(_ origin: PacedOrigin, held: Bool = false,
-                                   trickleFloorBytes: Int64? = nil) -> AVIOReader {
-        AVIOReader(url: URL(string: "http://127.0.0.1:\(origin.port)/movie.bin")!,
-                   boundedInitialFetch: held ? nil : firstRange,
-                   connStallTimeout: stallTimeout, trickleFloorBytes: trickleFloorBytes,
-                   heldConnection: held, backoffScale: 0.02)
+                                   trickleFloorBytes: Int64? = nil,
+                                   playbackByteRate: Int64? = nil) -> AVIOReader {
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(origin.port)/movie.bin")!,
+                                boundedInitialFetch: held ? nil : firstRange,
+                                connStallTimeout: stallTimeout, trickleFloorBytes: trickleFloorBytes,
+                                heldConnection: held, backoffScale: 0.02)
+        reader.setPlaybackByteRate(playbackByteRate)
+        return reader
     }
 
     /// Outcome of a read loop left running on its own thread, polled rather than awaited, so a test
@@ -476,5 +479,138 @@ struct TrickleWatchdogTests {
         #expect(reader.trickleEndCountForTesting == 0, "a healthy drip after a park was ended as a trickle")
         #expect(origin.requests.filter { $0.start == 0 }.count == 1,
                 "the healthy held connection was replaced: \(origin.requests.map(\.start))")
+    }
+
+    // MARK: - Rate trickle: well above the floor, far below the playback rate
+
+    /// Playback rate the rate-trickle tests declare: 2 MB/s. The rule ends under half of it.
+    private static let playbackRate: Int64 = 2_000_000
+    /// About 30% of `playbackRate` (15 KB every 25 ms, 600 KB/s): 300 KB per 0.5 s period, almost
+    /// six times the scaled floor of about 52 KB, so neither the floor nor the gap path can end it.
+    private static let slowPace = Pace.drip(bytes: 15_000, everyUs: 25_000)
+    /// About 80% of `playbackRate` (40 KB every 25 ms, 1.6 MB/s): under the average, over the cut.
+    private static let nearRatePace = Pace.drip(bytes: 40_000, everyUs: 25_000)
+
+    /// The field case, scaled: 4K DV at 25.4 Mbit/s over a debrid CDN that slowed to a fraction of
+    /// that but stayed far above the floor. Only the gap path ended it, after about 70 s.
+    @Test("a connection at 30% of the playback rate is ended early while a read starves",
+          .timeLimit(.minutes(1)))
+    func connectionFarBelowPlaybackRateIsReplaced() async throws {
+        let dripOffset = Self.dripOffset
+        let slow = Self.slowPace
+        let originMaybe = PacedOrigin(totalSize: Self.totalSize, pace: { start, attempt in
+            start == dripOffset && attempt == 1 ? slow : .fast
+        })
+        let origin = try #require(originMaybe)
+        defer { origin.stop() }
+        let reader = Self.makeReader(origin, playbackByteRate: Self.playbackRate)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        try await waitFor { !reader.hasLiveConnectionForTesting }
+
+        let target = Int(Self.firstRange) + 4 * 1024 * 1024
+        let progress = Self.startReading(reader, bytes: target)
+        try await waitFor { origin.requests.contains { $0.start == dripOffset } }
+        let dripRequest = origin.requests.first { $0.start == dripOffset }
+        let dripStartedAt = try #require(dripRequest?.at)
+
+        try await waitFor { reader.trickleEndCountForTesting > 0 || progress.done }
+        let detectedAfter = Date().timeIntervalSince(dripStartedAt)
+        #expect(reader.rateTrickleEndCountForTesting == 1, "the slow connection was not ended by the rate rule")
+        // The rule's own window plus a tick is about 0.25 s here; the old floor could never end this
+        // connection and the gap path never sees a 0.5 s gap.
+        #expect(detectedAfter < 2 * Self.stallTimeout,
+                "the rate trickle was ended \(detectedAfter)s after it started, the window is \(reader.rateTrickleWindowSeconds)s")
+
+        try await waitFor { progress.done }
+        #expect(progress.got == target, "the read did not complete after the slow connection was replaced")
+        #expect(reader.rateTrickleEndCountForTesting == 1)
+        #expect(reader.trickleEndCountForTesting == 1)
+        #expect(origin.requests.contains { $0.start > dripOffset && $0.start < dripOffset + 4 * 1024 * 1024 },
+                "no replacement request after the rate trickle end: \(origin.requests.map(\.start))")
+    }
+
+    @Test("a connection at 80% of the playback rate is not ended by the rate rule",
+          .timeLimit(.minutes(1)))
+    func connectionNearPlaybackRateIsLeftAlone() async throws {
+        let dripOffset = Self.dripOffset
+        let nearRate = Self.nearRatePace
+        let originMaybe = PacedOrigin(totalSize: Self.totalSize, pace: { start, _ in
+            start == dripOffset ? nearRate : .fast
+        })
+        let origin = try #require(originMaybe)
+        defer { origin.stop() }
+        let reader = Self.makeReader(origin, playbackByteRate: Self.playbackRate)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        try await waitFor { !reader.hasLiveConnectionForTesting }
+
+        // About 2 s of starved reading at 1.6 MB/s: several rate windows and stall periods.
+        let target = Int(Self.firstRange) + 3 * 1024 * 1024
+        let progress = Self.startReading(reader, bytes: target)
+        try await waitFor { progress.done }
+        #expect(progress.got == target)
+        #expect(reader.rateTrickleEndCountForTesting == 0, "a connection at 80% of the rate was ended")
+        #expect(reader.trickleEndCountForTesting == 0)
+        #expect(origin.requests.filter { $0.start == dripOffset }.count == 1)
+        #expect(!origin.requests.contains { $0.start > dripOffset && $0.start < dripOffset + 3 * 1024 * 1024 },
+                "the near-rate stream was replaced: \(origin.requests.map(\.start))")
+    }
+
+    @Test("without a playback rate the same slow connection keeps the old behaviour",
+          .timeLimit(.minutes(1)))
+    func slowConnectionWithoutPlaybackRateIsLeftAlone() async throws {
+        let dripOffset = Self.dripOffset
+        let slow = Self.slowPace
+        let originMaybe = PacedOrigin(totalSize: Self.totalSize, pace: { start, _ in
+            start == dripOffset ? slow : .fast
+        })
+        let origin = try #require(originMaybe)
+        defer { origin.stop() }
+        let reader = Self.makeReader(origin)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        try await waitFor { !reader.hasLiveConnectionForTesting }
+
+        // About 3.5 s at 600 KB/s, seven stall periods: above the floor throughout, so the old rules
+        // never end it, and nothing else may either.
+        let target = Int(Self.firstRange) + 2 * 1024 * 1024
+        let progress = Self.startReading(reader, bytes: target)
+        try await waitFor { progress.done }
+        #expect(progress.got == target)
+        #expect(reader.trickleEndCountForTesting == 0, "a connection above the floor was ended with no rate set")
+        #expect(reader.rateTrickleEndCountForTesting == 0)
+        #expect(origin.requests.filter { $0.start == dripOffset }.count == 1)
+        #expect(!origin.requests.contains { $0.start > dripOffset && $0.start < dripOffset + 2 * 1024 * 1024 },
+                "the slow stream was replaced with no rate set: \(origin.requests.map(\.start))")
+    }
+
+    @Test("an origin slow on every connection is rate-ended no more often than the minimum interval",
+          .timeLimit(.minutes(1)))
+    func perpetualRateTrickleIsPaced() async throws {
+        let dripOffset = Self.dripOffset
+        let slow = Self.slowPace
+        let originMaybe = PacedOrigin(totalSize: Self.totalSize, pace: { start, _ in
+            start >= dripOffset && start < dripOffset + 64 * 1024 * 1024 ? slow : .fast
+        })
+        let origin = try #require(originMaybe)
+        defer { origin.stop() }
+        let reader = Self.makeReader(origin, playbackByteRate: Self.playbackRate)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        try await waitFor { !reader.hasLiveConnectionForTesting }
+
+        let progress = Self.startReading(reader, bytes: Int(Self.firstRange) + 32 * 1024 * 1024)
+        try await waitFor { reader.rateTrickleEndCountForTesting >= 1 }
+        let firstEnd = Date()
+        try await waitFor { reader.rateTrickleEndCountForTesting >= 2 }
+        let spacing = Date().timeIntervalSince(firstEnd)
+        let minInterval = reader.rateTrickleMinIntervalSeconds
+        // Polling observes each end up to one 20 ms poll late, so the tolerance covers two polls.
+        #expect(spacing >= minInterval - 0.05,
+                "second rate end \(spacing)s after the first, the minimum interval is \(minInterval)s")
+        // Every end in between would have been the old rules', and this pace is above the floor.
+        #expect(reader.trickleEndCountForTesting == reader.rateTrickleEndCountForTesting)
+        #expect(!progress.done, "the read gave up on an origin that is slow, not dead")
     }
 }
