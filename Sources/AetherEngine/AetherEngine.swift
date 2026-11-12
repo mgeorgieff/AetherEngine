@@ -7994,9 +7994,19 @@ public final class AetherEngine: ObservableObject {
     /// Sodalite#175: the panel mode belongs to every engine still playing, so a reset waits for the last one out.
     private func resetDisplayCriteriaRespectingOthers() {
         let id = ObjectIdentifier(self)
-        if SharedOutputCoordinator.shared.othersActive(besides: id) {
+        let coordinator = SharedOutputCoordinator.shared
+        let others = coordinator.otherMemberLabels(besides: id)
+        if !others.isEmpty {
             let controller = displayCriteria
-            SharedOutputCoordinator.shared.deferCriteriaReset(for: id) { controller.reset() }
+            // Its own tag: a final stop has already left the coordinator, which then knows no label.
+            let label = logTag ?? coordinator.label(for: id)
+            // The line a field log needs to tell "deferred" from "nothing to reset": the reset now waits
+            // for every engine named here to leave with a final stop().
+            EngineLog.emit(
+                "[DisplayCriteria] RESET deferred for \(label): \(others.count) other engine(s) still registered "
+                + "(\(others.joined(separator: ", "))); runs when the last one leaves with a final stop()",
+                category: .engine)
+            coordinator.deferCriteriaReset(for: id, owner: self, label: label) { controller.reset() }
         } else {
             displayCriteria.reset()
         }

@@ -32,7 +32,16 @@ final class SharedOutputCoordinator {
     private var releaseOwed = false
     /// Criteria writers that stopped while others still played. Keyed by engine, so one that loads
     /// again as `.primary` drops its own reset instead of having it wipe the criteria it has just written.
-    private var deferredCriteriaResets: [ObjectIdentifier: @MainActor () -> Void] = [:]
+    /// The owner is held weakly beside it: a host that builds an engine per item releases the old one,
+    /// and the next engine can be allocated at the same address, so the identifier alone made a NEW
+    /// engine's join drop the reset of the one before it.
+    private struct DeferredReset {
+        weak var owner: AnyObject?
+        let tracksOwner: Bool
+        let label: String
+        let run: @MainActor () -> Void
+    }
+    private var deferredCriteriaResets: [ObjectIdentifier: DeferredReset] = [:]
     private var lastTransition: Task<Void, Never>?
     private var categoryConfiguration: Task<Bool, Never>?
     private var categoryConfigured = false
@@ -49,22 +58,43 @@ final class SharedOutputCoordinator {
         return members.values.compactMap(\.sourceChannels).max()
     }
 
-    /// Drops members whose engine was deallocated without a `stop()`. Leaves the deferred resets and
-    /// the owed release alone: the next `leave` or read decides.
+    /// Drops members whose engine was deallocated without a `stop()`, and leaves the owed release to the
+    /// next `leave`. Deferred criteria resets run here once nobody is left: they were waiting for the last
+    /// engine out, and a released engine never calls `leave`, so without this they waited for an engine
+    /// that no longer existed (until some later round's last-out ran them over that round's criteria).
     private func pruneReleasedOwners() {
         let gone = members.filter { $0.value.tracksOwner && $0.value.owner == nil }
+        guard !gone.isEmpty else { return }
         for (id, member) in gone {
             members[id] = nil
-            deferredCriteriaResets[id] = nil
+            if let dropped = deferredCriteriaResets.removeValue(forKey: id) {
+                EngineLog.emit("[SharedOutput] deferred criteria reset of \(dropped.label) dropped: its engine was released", category: .engine)
+            }
             EngineLog.emit("[SharedOutput] \(member.tag ?? "engine-\(UInt(bitPattern: id.hashValue) % 10_000)") was released without stop(), dropped", category: .engine)
         }
+        if members.isEmpty { runDeferredCriteriaResets(reason: "the last other engine was released without stop()") }
+    }
+
+    private func runDeferredCriteriaResets(reason: String) {
+        guard !deferredCriteriaResets.isEmpty else { return }
+        let resets = deferredCriteriaResets.values
+        deferredCriteriaResets.removeAll()
+        EngineLog.emit(
+            "[SharedOutput] running \(resets.count) deferred criteria reset(s) (\(resets.map(\.label).sorted().joined(separator: ", "))): \(reason)",
+            category: .engine)
+        resets.forEach { $0.run() }
     }
 
     func join(_ id: ObjectIdentifier, role: SharedOutputRole, tag: String?, owner: AnyObject? = nil) {
         let channels = members[id]?.sourceChannels
         members[id] = Member(role: role, tag: tag, sourceChannels: channels, owner: owner, tracksOwner: owner != nil)
-        // A secondary never writes criteria the pending reset could wipe, so it keeps the reset owed.
-        if role == .primary { deferredCriteriaResets[id] = nil }
+        // A secondary never writes criteria the pending reset could wipe, so it keeps the reset owed. Only
+        // the engine that deferred it may drop it; another one at a reused address keeps it owed.
+        if role == .primary, let pending = deferredCriteriaResets[id],
+           !pending.tracksOwner || (owner != nil && pending.owner === owner) {
+            deferredCriteriaResets[id] = nil
+            EngineLog.emit("[SharedOutput] deferred criteria reset of \(pending.label) dropped: it loads again as primary", category: .engine)
+        }
     }
 
     func noteSourceChannels(_ channels: Int?, for id: ObjectIdentifier) {
@@ -79,22 +109,28 @@ final class SharedOutputCoordinator {
         guard members.isEmpty else { return .othersRemain(members.count) }
         let release = releaseOwed
         releaseOwed = false
-        let resets = deferredCriteriaResets.values
-        deferredCriteriaResets.removeAll()
-        resets.forEach { $0() }
+        runDeferredCriteriaResets(reason: "last engine out")
         return .lastOut(releaseSession: release)
     }
 
     func othersActive(besides id: ObjectIdentifier) -> Bool {
+        !otherMemberLabels(besides: id).isEmpty
+    }
+
+    /// The members other than `id`, by log label, so a deferral can say who it waits for.
+    func otherMemberLabels(besides id: ObjectIdentifier) -> [String] {
         pruneReleasedOwners()
-        return members.keys.contains { $0 != id }
+        return members.filter { $0.key != id }.map { label(for: $0.key) }.sorted()
     }
 
     /// Defers a criteria reset to run when the last engine leaves, unless nobody else is playing now.
     /// If `id` is alone or not a member, the reset runs immediately.
-    func deferCriteriaReset(for id: ObjectIdentifier, _ body: @escaping @MainActor () -> Void) {
+    func deferCriteriaReset(for id: ObjectIdentifier, owner: AnyObject? = nil, label: String? = nil,
+                            _ body: @escaping @MainActor () -> Void) {
         guard othersActive(besides: id) else { body(); return }
-        deferredCriteriaResets[id] = body
+        deferredCriteriaResets[id] = DeferredReset(
+            owner: owner, tracksOwner: owner != nil,
+            label: label ?? "engine-\(UInt(bitPattern: id.hashValue) % 10_000)", run: body)
     }
 
     /// One queue for every engine's activation and release. AE#538 ordered them per engine; with two

@@ -20,6 +20,15 @@ the public-API contract.
   28 s, then every 30 s. Each connection still gets its full 8 s window before it can be judged. The episode
   ends when a connection delivers half the playback rate over a full window, or when no read has waited
   for 30 s. The log line gains `burst=N`.
+- **A display-criteria reset is no longer lost behind a released or replaced engine.** A reset deferred
+  because other engines were still registered now runs when the last of them is released without
+  `stop()`, instead of waiting for some later engine's final stop. A new engine allocated at the address
+  of a released one no longer cancels that engine's deferred reset when it loads as `.primary`.
+- **Every skipped or deferred display-criteria reset is logged.** `[DisplayCriteria] RESET skipped` says
+  whether the controller never applied criteria or had no window, `[DisplayCriteria] RESET deferred for
+  <tag>` names the engines it waits for, and `[SharedOutput]` lines say when deferred resets run or are
+  dropped. An engine stopped with `stop(resetDisplayCriteria: false)` and kept alive still counts as
+  playing and holds every other engine's reset until it gets a final `stop()`.
 
 ## [7.49.0] - 2026-10-27
 

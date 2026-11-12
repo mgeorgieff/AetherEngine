@@ -1342,10 +1342,22 @@ final class DisplayCriteriaController {
     /// Nil-out preferredDisplayCriteria to return the panel to default. No-op when apply() was never called this session (suppressed host) to avoid racing AVKit's in-flight criteria management.
     func reset() {
         #if os(tvOS)
-        guard didApply else { return }
+        guard didApply else {
+            // Silent before, which made "this controller never wrote" indistinguishable from "no reset
+            // was asked for". Whether the manager still holds criteria tells whether someone else did.
+            let held = resolveWindow().map { $0.avDisplayManager.preferredDisplayCriteria != nil }
+            EngineLog.emit(
+                "[DisplayCriteria] RESET skipped: this controller did not apply criteria (didApply=false); "
+                + "manager holds criteria: \(held.map { $0 ? "yes" : "no" } ?? "no window")",
+                category: .engine)
+            return
+        }
         guard let window = resolveWindow() else {
             didApply = false
             lastApplied = nil
+            EngineLog.emit(
+                "[DisplayCriteria] RESET skipped: no window; state cleared, the criteria written stay on the display",
+                category: .engine)
             return
         }
         logPanelReadout("before reset", window: window)

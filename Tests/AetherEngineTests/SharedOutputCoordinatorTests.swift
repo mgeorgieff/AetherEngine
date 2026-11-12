@@ -149,6 +149,71 @@ struct SharedOutputCoordinatorTests {
         #expect(resets == 1)
     }
 
+    // MARK: - The display mode handed back (Apple TV, 2026-11-12)
+    //
+    // Device logs from three Apple TVs showed a `[DisplayCriteria] SET` at every load and never a
+    // RESET, and the home screen after an HDR10 23.976 title looked low resolution. The host builds an
+    // engine per item and keeps others alive beside it, so a stopped engine's reset is deferred here.
+
+    @Test("a new engine at a reused address does not drop the previous engine's deferred reset")
+    func reusedIdentifierKeepsDeferredReset() {
+        let c = SharedOutputCoordinator()
+        var resets = 0
+        let previous = Token(), next = Token(), other = Token()
+        c.join(a, role: .primary, tag: "vod", owner: previous)
+        c.join(b, role: .secondary, tag: "live", owner: other)
+        _ = c.leave(a, releasesSession: true)
+        c.deferCriteriaReset(for: a, owner: previous) { resets += 1 }
+        // A different engine joins under the same identifier, as a freed engine's address allows.
+        c.join(a, role: .primary, tag: "vod2", owner: next)
+        _ = c.leave(a, releasesSession: true)
+        #expect(resets == 0, "a reset ran while another engine still played")
+        _ = c.leave(b, releasesSession: true)
+        #expect(resets == 1, "the previous engine's reset was dropped by the next engine's join")
+    }
+
+    @Test("the engine that deferred a reset still drops it when it loads again as primary")
+    func sameOwnerRejoinDropsItsReset() {
+        let c = SharedOutputCoordinator()
+        var resets = 0
+        c.join(a, role: .primary, tag: nil, owner: tokenA)
+        c.join(b, role: .secondary, tag: "tile2", owner: tokenB)
+        _ = c.leave(a, releasesSession: true)
+        c.deferCriteriaReset(for: a, owner: tokenA) { resets += 1 }
+        c.join(a, role: .primary, tag: nil, owner: tokenA)
+        _ = c.leave(b, releasesSession: true)
+        #expect(resets == 0)
+    }
+
+    @Test("a deferred reset runs once the engine it waited for is released without stop()")
+    func deferredResetRunsWhenLastOtherIsReleased() {
+        let c = SharedOutputCoordinator()
+        var resets = 0
+        var live: Token? = Token()
+        let liveID = ObjectIdentifier(live!)
+        c.join(liveID, role: .secondary, tag: "live", owner: live)
+        c.join(a, role: .primary, tag: "vod", owner: tokenA)
+        _ = c.leave(a, releasesSession: true)
+        c.deferCriteriaReset(for: a, owner: tokenA) { resets += 1 }
+        #expect(resets == 0)
+        live = nil
+        // Any read that prunes finds nobody left. Before, the reset waited for a later round's last-out.
+        #expect(!c.othersActive(besides: a))
+        #expect(resets == 1)
+        #expect(c.leave(a, releasesSession: true) == .notMember)
+        #expect(resets == 1)
+    }
+
+    @Test("a deferral names the engines it waits for")
+    func otherMemberLabelsNameTheBlockers() {
+        let c = SharedOutputCoordinator()
+        c.join(a, role: .primary, tag: "vod", owner: tokenA)
+        c.join(b, role: .secondary, tag: "live", owner: tokenB)
+        #expect(c.otherMemberLabels(besides: a) == ["live"])
+        _ = c.leave(b, releasesSession: true)
+        #expect(c.otherMemberLabels(besides: a).isEmpty)
+    }
+
     private actor Journal {
         private(set) var entries: [String] = []
         func note(_ entry: String) { entries.append(entry) }
