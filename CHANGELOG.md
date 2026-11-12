@@ -10,7 +10,16 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A source that is slow on several connections in a row is replaced sooner.**
+  The rate trickle rule ended at most one connection per 30 s. Field trace on an Apple TV (4K HEVC at
+  3098 KB/s): after one rate end, the next connection ran at 94 KB/s and was left 27 s for the floor rule,
+  and the whole stall lasted about 69 s. Within one starvation episode, the 2nd and 3rd rate ends may now
+  come 10 s after the previous one, so a source slow on every connection is replaced at about 8, 18 and
+  28 s, then every 30 s. Each connection still gets its full 8 s window before it can be judged. The episode
+  ends when a connection delivers half the playback rate over a full window, or when no read has waited
+  for 30 s. The log line gains `burst=N`.
 
 ## [7.49.0] - 2026-10-27
 

@@ -29,6 +29,8 @@ struct TrickleWatchdogTests {
         case drip(bytes: Int, everyUs: useconds_t)
         /// `bytes` at loopback speed, then nothing more on an open socket (no FIN, no error).
         case silentAfter(bytes: Int)
+        /// `first` for the first `bytes` of the body, then `then`.
+        indirect case switchAfter(bytes: Int, first: Pace, then: Pace)
     }
 
     /// Loopback 206 origin with a per-request pace. Keep-alive, Range-aware, no other features.
@@ -144,7 +146,10 @@ struct TrickleWatchdogTests {
             var sent: Int64 = 0
             while sent < length {
                 if stopped { return false }
-                let current = paceOverride ?? requested
+                var current = paceOverride ?? requested
+                while case .switchAfter(let bytes, let first, let then) = current {
+                    current = sent < Int64(bytes) ? first : then
+                }
                 let piece: Int
                 var sleepUs: useconds_t = 0
                 switch current {
@@ -159,6 +164,8 @@ struct TrickleWatchdogTests {
                         return false
                     }
                     piece = min(body.count, bytes - Int(sent))
+                case .switchAfter:
+                    return false   // resolved above
                 }
                 let n = Int(min(Int64(piece), length - sent))
                 guard writeAll(fd, Array(body[0..<n])) else { return false }
@@ -585,13 +592,28 @@ struct TrickleWatchdogTests {
                 "the slow stream was replaced with no rate set: \(origin.requests.map(\.start))")
     }
 
-    @Test("an origin slow on every connection is rate-ended no more often than the minimum interval",
-          .timeLimit(.minutes(1)))
-    func perpetualRateTrickleIsPaced() async throws {
-        let dripOffset = Self.dripOffset
-        let slow = Self.slowPace
+    // MARK: - Rate trickle burst: consecutive slow generations
+
+    /// Numbers the requests in the slow region, so a test can pace the 1st, 2nd, 3rd connection
+    /// differently. The region is `dripOffset` up to the last 64 MiB, which keeps the open's tail
+    /// probe out of the count.
+    final class RequestOrdinal: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func next() -> Int { lock.lock(); defer { lock.unlock() }; count += 1; return count }
+        static func inRegion(_ start: Int64) -> Bool {
+            start >= TrickleWatchdogTests.dripOffset && start < TrickleWatchdogTests.totalSize - 64 * 1024 * 1024
+        }
+    }
+
+    /// Runs a reader against an origin whose connections at or past `dripOffset` are paced by their
+    /// ordinal, until `ends` rate-trickle ends have happened. Returns the reader's end records and
+    /// the region's request times.
+    private static func observeRateEnds(_ ends: Int, pace: @escaping @Sendable (Int) -> Pace,
+                                        check: (AVIOReader, [(at: Date, burst: Int)], [Date]) -> Void) async throws {
+        let ordinal = RequestOrdinal()
         let originMaybe = PacedOrigin(totalSize: Self.totalSize, pace: { start, _ in
-            start >= dripOffset && start < dripOffset + 64 * 1024 * 1024 ? slow : .fast
+            RequestOrdinal.inRegion(start) ? pace(ordinal.next()) : .fast
         })
         let origin = try #require(originMaybe)
         defer { origin.stop() }
@@ -600,17 +622,109 @@ struct TrickleWatchdogTests {
         try reader.open()
         try await waitFor { !reader.hasLiveConnectionForTesting }
 
-        let progress = Self.startReading(reader, bytes: Int(Self.firstRange) + 32 * 1024 * 1024)
-        try await waitFor { reader.rateTrickleEndCountForTesting >= 1 }
-        let firstEnd = Date()
-        try await waitFor { reader.rateTrickleEndCountForTesting >= 2 }
-        let spacing = Date().timeIntervalSince(firstEnd)
-        let minInterval = reader.rateTrickleMinIntervalSeconds
-        // Polling observes each end up to one 20 ms poll late, so the tolerance covers two polls.
-        #expect(spacing >= minInterval - 0.05,
-                "second rate end \(spacing)s after the first, the minimum interval is \(minInterval)s")
-        // Every end in between would have been the old rules', and this pace is above the floor.
+        let progress = Self.startReading(reader, bytes: Int(Self.firstRange) + 64 * 1024 * 1024)
+        try await waitFor { reader.rateTrickleEndCountForTesting >= ends }
+        // Every end so far was the rate rule's: the slow pace is above the floor and never silent.
         #expect(reader.trickleEndCountForTesting == reader.rateTrickleEndCountForTesting)
         #expect(!progress.done, "the read gave up on an origin that is slow, not dead")
+        check(reader, Array(reader.rateTrickleEndsForTesting.prefix(ends)),
+              origin.requests.filter { RequestOrdinal.inRegion($0.start) }.map(\.at))
+    }
+
+    /// The field case (Apple TV, 4K HEVC at 3098 KB/s, 2026-11-12): gen 4 was rate-ended, gen 5 ran at
+    /// 94 KB/s and was left 27 s for the floor rule because the 30 s interval had not passed.
+    @Test("three slow generations in a row are rate-ended one burst interval apart",
+          .timeLimit(.minutes(1)))
+    func threeSlowGenerationsAreEndedInABurst() async throws {
+        let slow = Self.slowPace
+        try await Self.observeRateEnds(3, pace: { _ in slow }) { reader, ends, _ in
+            let burst = reader.rateTrickleBurstIntervalSeconds
+            let minInterval = reader.rateTrickleMinIntervalSeconds
+            #expect(ends.map(\.burst) == [1, 2, 3])
+            for (later, earlier) in zip(ends.dropFirst(), ends) {
+                let spacing = later.at.timeIntervalSince(earlier.at)
+                // 10 ms covers the recorded Date against the uptime clock the gate measures on.
+                #expect(spacing >= burst - 0.01, "rate ends \(spacing)s apart, the burst interval is \(burst)s")
+                #expect(spacing < minInterval, "rate ends \(spacing)s apart, paced by the min interval \(minInterval)s")
+            }
+        }
+    }
+
+    @Test("the fourth slow generation in a row waits the full minimum interval",
+          .timeLimit(.minutes(1)))
+    func fourthSlowGenerationWaitsTheMinInterval() async throws {
+        let slow = Self.slowPace
+        try await Self.observeRateEnds(4, pace: { _ in slow }) { reader, ends, _ in
+            let minInterval = reader.rateTrickleMinIntervalSeconds
+            #expect(ends.map(\.burst) == [1, 2, 3, 4])
+            let spacing = ends[3].at.timeIntervalSince(ends[2].at)
+            #expect(spacing >= minInterval - 0.01,
+                    "fourth rate end \(spacing)s after the third, the minimum interval is \(minInterval)s")
+        }
+    }
+
+    @Test("a healthy generation between slow ones starts a new burst", .timeLimit(.minutes(1)))
+    func healthyGenerationResetsTheBurst() async throws {
+        let slow = Self.slowPace
+        // 64 KB every 20 ms, about 3.2 MB/s, over the playback rate: 2 MiB of it is about three rate
+        // windows of a starved read at or above the cut, then the same connection slows down.
+        let healthyThenSlow = Pace.switchAfter(bytes: 2 * 1024 * 1024,
+                                               first: .drip(bytes: 64 * 1024, everyUs: 20_000), then: slow)
+        try await Self.observeRateEnds(4, pace: { $0 == 3 ? healthyThenSlow : slow }) { reader, ends, _ in
+            // Without the reset the 3rd and 4th ends would be burst 3 and 4, the 4th a min interval late.
+            #expect(ends.map(\.burst) == [1, 2, 1, 2])
+            let spacing = ends[3].at.timeIntervalSince(ends[2].at)
+            #expect(spacing < reader.rateTrickleMinIntervalSeconds,
+                    "the end after the healthy generation was paced like a 4th: \(spacing)s")
+        }
+    }
+
+    @Test("a stretch with no starved read starts a new burst", .timeLimit(.minutes(1)))
+    func idleStretchResetsTheBurst() async throws {
+        let slow = Self.slowPace
+        let ordinal = RequestOrdinal()
+        // 1st connection slow, 2nd fast (it fills the window and ends at high water), then slow.
+        let originMaybe = PacedOrigin(totalSize: Self.totalSize, pace: { start, _ in
+            guard RequestOrdinal.inRegion(start) else { return .fast }
+            return ordinal.next() == 2 ? .fast : slow
+        })
+        let origin = try #require(originMaybe)
+        defer { origin.stop() }
+        let reader = Self.makeReader(origin, playbackByteRate: Self.playbackRate)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        try await waitFor { !reader.hasLiveConnectionForTesting }
+
+        let first = Self.startReading(reader, bytes: Int(Self.firstRange) + 1024 * 1024)
+        try await waitFor { first.done }
+        #expect(reader.rateTrickleEndCountForTesting == 1)
+        // The paused consumer: no read at all for longer than the min interval.
+        let idle = reader.rateTrickleMinIntervalSeconds * 1.5
+        _ = try await waitFor(upTo: .milliseconds(Int(idle * 1000))) { false }
+        let second = Self.startReading(reader, bytes: 48 * 1024 * 1024)
+        try await waitFor { reader.rateTrickleEndCountForTesting >= 2 || second.done }
+        #expect(reader.rateTrickleEndsForTesting.map(\.burst) == [1, 1],
+                "the slow connection after the idle stretch was counted into the old episode")
+    }
+
+    @Test("a slow generation is never rate-ended before its own window has elapsed",
+          .timeLimit(.minutes(1)))
+    func slowGenerationGetsItsFullWindow() async throws {
+        let slow = Self.slowPace
+        try await Self.observeRateEnds(4, pace: { _ in slow }) { reader, ends, requests in
+            let window = reader.rateTrickleWindowSeconds
+            for end in ends {
+                // The connection this end cut is the newest region request before it.
+                guard let startedAt = requests.last(where: { $0 < end.at }) else {
+                    Issue.record("no request before the rate end at \(end.at)")
+                    continue
+                }
+                let lived = end.at.timeIntervalSince(startedAt)
+                // 20 ms: the starved clock starts at the read loop's wait, a moment before the
+                // origin records the request.
+                #expect(lived >= window - 0.02,
+                        "burst \(end.burst): generation ended \(lived)s after its request, the window is \(window)s")
+            }
+        }
     }
 }

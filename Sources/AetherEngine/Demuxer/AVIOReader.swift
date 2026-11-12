@@ -718,6 +718,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// connection is then still replaced, but no more often than this; the floor and the gap path
     /// keep their own pacing in between.
     static let rateTrickleMinInterval: TimeInterval = 30
+    /// Within one starvation episode, rate-trickle ends 2 to `rateTrickleBurstCount` may come this
+    /// soon after the previous one; from the next end on `rateTrickleMinInterval` applies. Field case
+    /// (Apple TV, 4K HEVC at 3098 KB/s): three slow connections in a row, and the second waited out
+    /// the 30 s interval and then the floor rule, 27 s on a 94 KB/s connection, for a 69 s stall in
+    /// all. With the burst, a source slow on every connection is replaced at about 8, 18 and 28 s,
+    /// then every 30 s. An episode ends when a generation delivers at least `rateTrickleFraction` of
+    /// the playback rate over a full rate window while a read waits, or when no read has been
+    /// starved for `rateTrickleMinInterval`. Scaled with `connStallTimeout` like the others.
+    static let rateTrickleBurstInterval: TimeInterval = 10
+    static let rateTrickleBurstCount = 3
     /// #450: fraction of the stall threshold at which a generation that has seen no first byte is
     /// REPORTED. Derived from the threshold rather than set beside it so the invariant holds at
     /// every value of the threshold, the shortened ones tests run with included: the witness speaks
@@ -901,6 +911,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return rateTrickleEnds
     }
 
+    /// When each rate-trickle end happened and its place in the episode (`burst=` in the log line).
+    var rateTrickleEndsForTesting: [(at: Date, burst: Int)] {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return rateTrickleEndRecords
+    }
+
     var deliveryGapSecondsForTesting: Double {
         winCond.lock()
         defer { winCond.unlock() }
@@ -1025,6 +1042,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var playbackByteRate: Int64?
     private var lastRateTrickleEndAt: DispatchTime?
     private var rateTrickleEnds = 0
+    /// Rate ends in the current starvation episode (`rateTrickleBurstInterval`), and when the last
+    /// read that waited on forward data returned, so a stretch with no starved read can end the
+    /// episode. Both winCond-guarded and spanning generations.
+    private var rateTrickleBurst = 0
+    private var lastStarvedReadEndedAt: DispatchTime?
+    private var rateTrickleEndRecords: [(at: Date, burst: Int)] = []
     /// The delivery-gap watchdog's pending tick: its token and when it fires. A tick armed with a
     /// newer token supersedes the pending one, which then returns without acting, so the read loop
     /// can bring the next tick forward while staying at one live closure per generation.
@@ -1270,12 +1293,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// trickle. `trickleFloorBytesDefault` scaled to this reader's stall threshold unless a caller
     /// overrides it.
     private let trickleFloorBytes: Int64
-    /// `rateTrickleSeconds`, `rateTrickleTick` and `rateTrickleMinInterval` scaled to this reader's
-    /// stall threshold by the ratio `trickleFloorBytes` uses, never above the shipped values.
+    /// `rateTrickleSeconds`, `rateTrickleTick`, `rateTrickleMinInterval` and
+    /// `rateTrickleBurstInterval` scaled to this reader's stall threshold by the ratio
+    /// `trickleFloorBytes` uses, never above the shipped values.
     /// Internal so tests can state their timing in the reader's own terms.
     let rateTrickleWindowSeconds: TimeInterval
     let rateTrickleTickSeconds: TimeInterval
     let rateTrickleMinIntervalSeconds: TimeInterval
+    let rateTrickleBurstIntervalSeconds: TimeInterval
     /// #450: when this reader reports a generation that is on the link with nothing delivered.
     private var firstByteWitnessDelay: TimeInterval {
         min(Self.firstByteWitnessMaxSeconds, connStallTimeout * Self.firstByteWitnessFraction)
@@ -1338,6 +1363,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.rateTrickleTickSeconds = min(Self.rateTrickleTick, Self.rateTrickleTick * stallScale)
         self.rateTrickleMinIntervalSeconds = min(Self.rateTrickleMinInterval,
                                                  Self.rateTrickleMinInterval * stallScale)
+        self.rateTrickleBurstIntervalSeconds = min(Self.rateTrickleBurstInterval,
+                                                   Self.rateTrickleBurstInterval * stallScale)
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
         self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
@@ -2448,7 +2475,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         defer {
             winCond.lock()
             forwardWaitActive = false
-            if !enteredForwardWait { forwardWaitSince = nil }
+            if enteredForwardWait {
+                lastStarvedReadEndedAt = DispatchTime.now()
+            } else {
+                forwardWaitSince = nil
+            }
             winCond.unlock()
         }
         defer {
@@ -2823,6 +2854,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                     // No mark from before the starvation began may be judged: one taken ahead of a
                     // full-window park would fold the park's zero delivery into the span.
                     trickleSamples = [(waitStart, genDeliveredBytes)]
+                }
+                // First wait of this read: if no read has been starved for the min interval, the
+                // previous starvation episode is over and its rate-trickle burst with it. A read that
+                // is still waiting never gets here twice, so a long starvation cannot reset itself.
+                if !forwardWaitActive, rateTrickleBurst > 0, let last = lastStarvedReadEndedAt,
+                   waitStart.uptimeNanoseconds >= last.uptimeNanoseconds,
+                   Double(waitStart.uptimeNanoseconds - last.uptimeNanoseconds) / 1_000_000_000
+                       >= rateTrickleMinIntervalSeconds {
+                    rateTrickleBurst = 0
                 }
                 enteredForwardWait = true
                 forwardWaitActive = true
@@ -3946,7 +3986,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// `trickleFloorBytes` delivered over the last `connStallTimeout`, ends the generation.
     /// With a playback rate set, a shorter rule runs first (`rateTrickleSeconds`): starved for
     /// `rateTrickleWindowSeconds` and delivering under `rateTrickleFraction` of the playback rate
-    /// over that span, no sooner than `rateTrickleMinIntervalSeconds` after the last such end.
+    /// over that span, no sooner than `rateTrickleMinIntervalSeconds` after the last such end (or
+    /// `rateTrickleBurstIntervalSeconds` for the 2nd to `rateTrickleBurstCount`-th end of one episode).
+    /// A full window at or above the cut ends the episode.
     /// Caller holds `winCond`; records this tick's mark either way.
     private func trickleVerdictLocked() -> TrickleVerdict? {
         let now = DispatchTime.now()
@@ -3964,7 +4006,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // the `since` bound below also keeps a previous generation out of the span.
         if let rate = playbackByteRate, rate > 0, forwardWaitActive, let since = forwardWaitSince,
            seconds(since: since) >= rateTrickleWindowSeconds,
-           lastRateTrickleEndAt.map({ seconds(since: $0) >= rateTrickleMinIntervalSeconds }) ?? true,
            let mark = trickleSamples.last(where: {
                seconds(since: $0.at) >= rateTrickleWindowSeconds
                    && $0.at.uptimeNanoseconds >= since.uptimeNanoseconds
@@ -3972,8 +4013,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let span = seconds(since: mark.at)
             let delivered = bytes - mark.bytes
             if Double(delivered) / span < Self.rateTrickleFraction * Double(rate) {
-                return TrickleVerdict(bytes: delivered, span: span, waited: seconds(since: since),
-                                      offset: forwardWaitOffset, playbackRate: rate)
+                // First end of an episode: no spacing. Ends 2 to `rateTrickleBurstCount`: the burst
+                // interval after the previous one. Every later end: the min interval.
+                let spacing = rateTrickleBurst == 0 ? 0
+                    : rateTrickleBurst < Self.rateTrickleBurstCount ? rateTrickleBurstIntervalSeconds
+                    : rateTrickleMinIntervalSeconds
+                if lastRateTrickleEndAt.map({ seconds(since: $0) >= spacing }) ?? true {
+                    return TrickleVerdict(bytes: delivered, span: span, waited: seconds(since: since),
+                                          offset: forwardWaitOffset, playbackRate: rate)
+                }
+            } else {
+                // This generation carried playback over a full window (the span never reaches back
+                // past its start, see above): the slow episode is over.
+                rateTrickleBurst = 0
             }
         }
         guard forwardWaitActive, let since = forwardWaitSince, seconds(since: since) >= connStallTimeout,
@@ -3998,8 +4050,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         trickleEnds += 1
         if verdict.playbackRate != nil {
             rateTrickleEnds += 1
+            rateTrickleBurst += 1
             lastRateTrickleEndAt = DispatchTime.now()
+            rateTrickleEndRecords.append((Date(), rateTrickleBurst))
+            if rateTrickleEndRecords.count > 64 { rateTrickleEndRecords.removeFirst() }
         }
+        let burst = rateTrickleBurst
         winCond.broadcast()
         winCond.unlock()
         transfer.cancelTransfer()
@@ -4009,7 +4065,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             EngineLog.emit(
                 "[AVIOReader] \(label) gen=\(generation) rate trickle: \(Int(kbps)) KB/s over "
                 + "\(String(format: "%.1f", verdict.span))s vs playback \(rate / 1024) KB/s while a read waited "
-                + "\(String(format: "%.1f", verdict.waited))s at offset \(verdict.offset); ending it",
+                + "\(String(format: "%.1f", verdict.waited))s at offset \(verdict.offset) burst=\(burst); ending it",
                 category: .demux)
             return
         }
