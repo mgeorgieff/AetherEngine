@@ -62,14 +62,14 @@ final class SharedOutputCoordinator {
     /// next `leave`. Deferred criteria resets run here once nobody is left: they were waiting for the last
     /// engine out, and a released engine never calls `leave`, so without this they waited for an engine
     /// that no longer existed (until some later round's last-out ran them over that round's criteria).
+    /// A pruned member never takes a deferred reset with it: both owners are weak and already nil, so a
+    /// released engine at a reused address cannot be told from the one that deferred, and the criteria
+    /// that engine wrote are still on the display either way. The reset stays owed to the last one out.
     private func pruneReleasedOwners() {
         let gone = members.filter { $0.value.tracksOwner && $0.value.owner == nil }
         guard !gone.isEmpty else { return }
         for (id, member) in gone {
             members[id] = nil
-            if let dropped = deferredCriteriaResets.removeValue(forKey: id) {
-                EngineLog.emit("[SharedOutput] deferred criteria reset of \(dropped.label) dropped: its engine was released", category: .engine)
-            }
             EngineLog.emit("[SharedOutput] \(member.tag ?? "engine-\(UInt(bitPattern: id.hashValue) % 10_000)") was released without stop(), dropped", category: .engine)
         }
         if members.isEmpty { runDeferredCriteriaResets(reason: "the last other engine was released without stop()") }

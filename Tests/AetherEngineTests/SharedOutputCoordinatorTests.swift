@@ -204,6 +204,26 @@ struct SharedOutputCoordinatorTests {
         #expect(resets == 1)
     }
 
+    @Test("pruning a released engine at a reused address keeps the earlier engine's deferred reset")
+    func pruneAtReusedIdentifierKeepsDeferredReset() {
+        let c = SharedOutputCoordinator()
+        var resets = 0
+        var previous: Token? = Token()
+        var tile: Token? = Token()
+        c.join(a, role: .primary, tag: "vod", owner: previous)
+        c.join(b, role: .secondary, tag: "live", owner: tokenB)
+        _ = c.leave(a, releasesSession: true)
+        c.deferCriteriaReset(for: a, owner: previous) { resets += 1 }
+        previous = nil
+        // A secondary at the freed engine's address, released without stop().
+        c.join(a, role: .secondary, tag: "tile", owner: tile)
+        tile = nil
+        #expect(c.otherMemberLabels(besides: b).isEmpty, "the released tile was not pruned")
+        #expect(resets == 0, "a reset ran while another engine still played")
+        _ = c.leave(b, releasesSession: true)
+        #expect(resets == 1, "pruning the tile dropped the earlier engine's deferred reset")
+    }
+
     @Test("a deferral names the engines it waits for")
     func otherMemberLabelsNameTheBlockers() {
         let c = SharedOutputCoordinator()
