@@ -1386,8 +1386,11 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// AE#658: codec profile as libavcodec names it ("LC", "DTS-HD MA + DTS:X", "Dolby TrueHD + Dolby Atmos"),
     /// nil when undeclared. This is where DTS:X and TrueHD Atmos show up; `isAtmos` covers E-AC-3 JOC only.
     public let profile: String?
+    /// Matroska `NUMBER_OF_FRAMES` statistics tag (mkvmerge's per-track block count; for subtitles the number of
+    /// events), 0 when the container declares none. Lets hosts tell a forced-only subtitle track from a full one.
+    public let frameCount: Int
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil, isDTSX: Bool = false) {
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil, isDTSX: Bool = false, frameCount: Int = 0) {
         self.sampleRate = sampleRate
         self.bitsPerSample = bitsPerSample
         self.sampleFormat = sampleFormat
@@ -1408,6 +1411,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
         self.assHeader = assHeader
         self.isExternal = isExternal
         self.isNativelyRenderedSubtitle = isNativelyRenderedSubtitle
+        self.frameCount = frameCount
     }
 
     /// libavcodec's DTS:X profiles, "DTS-HD MA + DTS:X" and "DTS-HD MA + DTS:X IMAX". `dca` is the

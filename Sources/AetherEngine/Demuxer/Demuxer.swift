@@ -1926,6 +1926,9 @@ public final class Demuxer: @unchecked Sendable {
         let isCommentary = (disposition & AV_DISPOSITION_COMMENT) != 0
         let channels = Int(codecpar.pointee.ch_layout.nb_channels)
         let bitrate = declaredBitrate(stream: stream)
+        // AV_DICT_IGNORE_SUFFIX also matches `NUMBER_OF_FRAMES-eng`, as `declaredBitrate` does for `BPS`.
+        let frameCount = Self.resolveFrameCount(metadataValue(stream.pointee.metadata, key: "NUMBER_OF_FRAMES",
+                                                              flags: Int32(AV_DICT_IGNORE_SUFFIX)))
 
         // EAC3 profile 30 = JOC (Dolby Atmos on streaming). Lets UI label "Atmos".
         let isAtmos = (codecpar.pointee.codec_id == AV_CODEC_ID_EAC3)
@@ -1963,7 +1966,8 @@ public final class Demuxer: @unchecked Sendable {
             bitsPerSample: isAudio ? Int(max(codecpar.pointee.bits_per_raw_sample, 0)) : 0,
             sampleFormat: isAudio ? Self.sampleFormatName(codecpar.pointee.format) : nil,
             channelLayout: isAudio ? Self.channelLayoutDescription(&codecpar.pointee.ch_layout) : nil,
-            profile: VideoStreamFormat.profileName(codecID: codecID, profile: codecpar.pointee.profile)
+            profile: VideoStreamFormat.profileName(codecID: codecID, profile: codecpar.pointee.profile),
+            frameCount: frameCount
         )
     }
 
@@ -2058,6 +2062,12 @@ public final class Demuxer: @unchecked Sendable {
             return parsed
         }
         return 0
+    }
+
+    /// Pure parse of the Matroska `NUMBER_OF_FRAMES` statistics tag: a positive integer, else 0.
+    static func resolveFrameCount(_ tag: String?) -> Int {
+        guard let tag, let n = Int(tag.trimmingCharacters(in: .whitespaces)), n > 0 else { return 0 }
+        return n
     }
 
     func stream(at index: Int32) -> UnsafeMutablePointer<AVStream>? {
